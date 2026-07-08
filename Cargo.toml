@@ -6,6 +6,7 @@ members = [
     "programs/psol-vault",
     "programs/psol-repo",
     "programs/psol-lending",
+    "programs/psol-settlement",
 ]
 
 [workspace.package]

@@ -18,7 +18,7 @@ A curated set of native (Pinocchio, `no_std`) Solana programs where the byte lay
 | `psol-vault` | share-based collateral vault primitive |
 | `psol-lending` | bilateral collateralized term loan, compliance-gated |
 | `psol-repo` | bilateral time-bound lock (repurchase agreement), compliance-gated |
-| `psol-settlement` | *(in progress)* self-contained atomic delivery-vs-payment: both legs settle atomically or not at all, forwarding TransferHook extras so compliance-gated mints work |
+| `psol-settlement` | self-contained atomic delivery-vs-payment: `SwapTicket` PDA escrows both legs and settles them atomically only after both parties fund and pass compliance — no external settlement channel required |
 
 Shared account layouts live in `crates/psol-types` (`repr(C)` + `bytemuck::Pod`).
 

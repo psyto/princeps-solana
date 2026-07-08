@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/psol-types",
+    "programs/psol-compliance",
+    "programs/psol-vault",
+    "programs/psol-repo",
+    "programs/psol-lending",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.79"
+license      = "MIT OR Apache-2.0"
+authors      = ["psyto <saito.hiroyuki@gmail.com>"]
+publish      = false
+
+[workspace.dependencies]
+psol-types = { path = "crates/psol-types" }
+
+# Pinocchio + ecosystem
+pinocchio        = "0.9.2"
+pinocchio-pubkey = "0.3"
+pinocchio-system = "0.4"
+
+# Zero-copy account serialization
+bytemuck = { version = "1.21", features = ["derive"] }
+
+# Test-only
+proptest = "1"
+
+[profile.release]
+overflow-checks = true
+lto             = "fat"
+codegen-units   = 1
+strip           = "symbols"

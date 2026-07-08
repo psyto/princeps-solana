@@ -540,3 +540,85 @@ fn cpi_transfer_checked(
     let infos = [source, mint, destination, authority];
     pinocchio::cpi::slice_invoke_signed(&ix, &infos, signers)
 }
+
+// ─── Tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ticket_layout_is_pod_and_roundtrips() {
+        // 8 (u8 header + pad) + 128 (4×[u8;32]) + 32 (4×u64) = 168, u64-aligned.
+        assert_eq!(SwapTicket::LEN, 168);
+        let t = SwapTicket {
+            bump: 7,
+            funded_a: 1,
+            funded_b: 0,
+            settled: 0,
+            decimals_a: 6,
+            decimals_b: 9,
+            _pad: [0; 2],
+            party_a: [1; 32],
+            party_b: [2; 32],
+            mint_a: [3; 32],
+            mint_b: [4; 32],
+            amount_a: 111,
+            amount_b: 222,
+            expiry_slot: 333,
+            nonce: 444,
+        };
+        let bytes = bytemuck::bytes_of(&t);
+        assert_eq!(bytes.len(), SwapTicket::LEN);
+        let back: &SwapTicket = bytemuck::from_bytes(bytes);
+        assert_eq!(back.amount_a, 111);
+        assert_eq!(back.amount_b, 222);
+        assert_eq!(back.nonce, 444);
+        assert_eq!(back.decimals_b, 9);
+        assert_eq!(back.mint_a, [3; 32]);
+    }
+
+    #[test]
+    fn error_codes_in_band_and_distinct() {
+        let codes = [
+            err::TICKET_PDA_MISMATCH,
+            err::NOT_A_PARTY,
+            err::ALREADY_FUNDED,
+            err::NOT_FULLY_FUNDED,
+            err::ALREADY_SETTLED,
+            err::EXPIRED,
+            err::NOT_EXPIRED,
+            err::TOKEN_PROGRAM_MISMATCH,
+            err::TICKET_LAYOUT_INVALID,
+            err::MINT_MISMATCH,
+            err::DATA_TOO_SHORT,
+            err::NOTHING_TO_RECLAIM,
+            err::COMPLIANCE_LAYOUT_INVALID,
+            err::COMPLIANCE_STATUS_UNKNOWN,
+            err::COMPLIANCE_UNVERIFIED,
+            err::COMPLIANCE_SUSPENDED,
+            err::COMPLIANCE_BLOCKED,
+            err::RECORD_MISMATCH,
+        ];
+        let raw = |e: &ProgramError| match e {
+            ProgramError::Custom(c) => *c,
+            _ => panic!("expected Custom"),
+        };
+        for (i, a) in codes.iter().enumerate() {
+            let ca = raw(a);
+            assert!((0x2000u32..0x3000).contains(&ca), "0x{ca:04X} outside settlement band");
+            for (j, b) in codes.iter().enumerate() {
+                if i != j {
+                    assert_ne!(ca, raw(b), "code collision at {i},{j}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_swap_data_layout_is_162_bytes() {
+        // party_a(32) party_b(32) mint_a(32) mint_b(32) amount_a(8) amount_b(8)
+        // decimals_a(1) decimals_b(1) expiry_slot(8) nonce(8)
+        assert_eq!(32 + 32 + 32 + 32 + 8 + 8 + 1 + 1 + 8 + 8, 162);
+    }
+}

@@ -1011,12 +1011,28 @@ fn ensure_position(
     depositor_key: &Pubkey,
 ) -> Result<u8, ProgramError> {
     // If the account already exists (owned by us, sized to Position::LEN),
-    // pull the bump out and short-circuit.
+    // pull the bump out and short-circuit — but first bind it to
+    // (vault, depositor), the same check `withdraw`'s `verify_position` makes.
+    // Without this bind, `deposit` accepted ANY program-owned, Position-sized
+    // account as "the position" (the PDA was only verified on the create path):
+    // a caller could pass a non-canonical / another participant's empty position
+    // and have it stamped to themselves, bricking it (griefing / fund-lock).
     if position_ai.owner() == program_id {
         let data = position_ai.try_borrow_data()?;
         if data.len() >= Position::LEN {
             let p: &Position = bytemuck::try_from_bytes(&data[..Position::LEN])
                 .map_err(|_| err::POSITION_LAYOUT_INVALID)?;
+            if &p.vault != vault_ai.key() || &p.depositor != depositor_key {
+                return Err(err::POSITION_PDA_MISMATCH);
+            }
+            let expected = create_program_address(
+                &[seeds::POSITION, vault_ai.key(), depositor_key, &[p.bump]],
+                program_id,
+            )
+            .map_err(|_| err::POSITION_PDA_MISMATCH)?;
+            if &expected != position_ai.key() {
+                return Err(err::POSITION_PDA_MISMATCH);
+            }
             return Ok(p.bump);
         }
     }

@@ -1,0 +1,30 @@
+[package]
+name = "psol-quickstart"
+description = "Runnable quickstarts, one per part. Each loads the parts' SBF builds into LiteSVM — no validator."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Nothing to build as a library; everything lives in `examples/`.
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+psol-types                   = { workspace = true }
+psol-compliance              = { path = "../programs/psol-compliance" }
+psol-vault                   = { path = "../programs/psol-vault" }
+psol-settlement              = { path = "../programs/psol-settlement" }
+psol-lending                 = { path = "../programs/psol-lending" }
+bytemuck                     = { workspace = true }
+pinocchio-pubkey             = { workspace = true }
+litesvm                      = "0.9.1"
+solana-address               = "2.6"
+solana-instruction           = "3"
+solana-keypair               = "3"
+solana-message               = "3"
+solana-program-pack          = "3"
+solana-signer                = "3"
+solana-system-interface      = "3"
+solana-transaction           = "3"
+spl-token-2022               = "10"

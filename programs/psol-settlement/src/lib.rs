@@ -85,6 +85,10 @@ pub mod err {
     pub const COMPLIANCE_PROGRAM_MISMATCH: ProgramError = ProgramError::Custom(0x2016);
     /// `create_swap`'s compliance program account is not executable.
     pub const COMPLIANCE_PROGRAM_NOT_EXECUTABLE: ProgramError = ProgramError::Custom(0x2017);
+    /// An escrow is not the ticket's token account for its leg's mint, or
+    /// a destination is not the right party's token account for the mint
+    /// it receives.
+    pub const TOKEN_ACCOUNT_MISMATCH: ProgramError = ProgramError::Custom(0x2018);
 }
 
 /// On-chain swap ticket. `repr(C)` + `Pod`: the byte layout is the contract.
@@ -274,7 +278,9 @@ fn fund(_program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> Program
     } else {
         return Err(err::NOT_A_PARTY);
     };
+    let leg_mint = *mint_ai.key();
     drop(raw);
+    require_token_account(escrow_ai, &leg_mint, ticket_ai.key())?;
 
     cpi_transfer_checked(
         token_program_ai.key(),
@@ -341,6 +347,12 @@ fn settle(program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> Progra
     }
     verify_record(record_a_ai, compliance_program_ai.key(), &t.party_a)?;
     verify_record(record_b_ai, compliance_program_ai.key(), &t.party_b)?;
+
+    // Escrows are the ticket's; each party receives into its own account.
+    require_token_account(escrow_a_ai, &t.mint_a, ticket_ai.key())?;
+    require_token_account(escrow_b_ai, &t.mint_b, ticket_ai.key())?;
+    require_token_account(party_a_dst_ai, &t.mint_b, &t.party_a)?;
+    require_token_account(party_b_dst_ai, &t.mint_a, &t.party_b)?;
 
     // Verify the ticket PDA + build its signer.
     let nonce_le = t.nonce.to_le_bytes();
@@ -441,6 +453,11 @@ fn reclaim(program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> Progr
     if mint_a_ai.key() != &t.mint_a || mint_b_ai.key() != &t.mint_b {
         return Err(err::MINT_MISMATCH);
     }
+    // Refunds go back to each party's own account.
+    require_token_account(escrow_a_ai, &t.mint_a, ticket_ai.key())?;
+    require_token_account(escrow_b_ai, &t.mint_b, ticket_ai.key())?;
+    require_token_account(party_a_dst_ai, &t.mint_a, &t.party_a)?;
+    require_token_account(party_b_dst_ai, &t.mint_b, &t.party_b)?;
 
     let nonce_le = t.nonce.to_le_bytes();
     let bump_seed = [t.bump];
@@ -551,6 +568,23 @@ fn verify_record(
     })
 }
 
+/// A Token-2022 token account for `mint` whose owner (authority) is
+/// `owner`. Token account layout: mint at [0..32], owner at [32..64].
+fn require_token_account(
+    ai: &AccountInfo,
+    mint: &[u8; 32],
+    owner: &[u8; 32],
+) -> ProgramResult {
+    if ai.owner() != &TOKEN_2022_PROGRAM_ID {
+        return Err(err::TOKEN_ACCOUNT_MISMATCH);
+    }
+    let data = ai.try_borrow_data()?;
+    if data.len() < 165 || &data[0..32] != mint || &data[32..64] != owner {
+        return Err(err::TOKEN_ACCOUNT_MISMATCH);
+    }
+    Ok(())
+}
+
 /// Construct + invoke a Token-2022 `TransferChecked` CPI.
 #[allow(clippy::too_many_arguments)]
 fn cpi_transfer_checked(
@@ -645,6 +679,7 @@ mod tests {
             err::RECORD_MISMATCH,
             err::COMPLIANCE_PROGRAM_MISMATCH,
             err::COMPLIANCE_PROGRAM_NOT_EXECUTABLE,
+            err::TOKEN_ACCOUNT_MISMATCH,
         ];
         let raw = |e: &ProgramError| match e {
             ProgramError::Custom(c) => *c,

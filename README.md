@@ -21,6 +21,11 @@ the contract. Take the one you need; the prime-broker flow they add up to is at 
 or your own. Each vault and each DvP ticket names its registry when it is created and accepts
 records from no other program.
 
+The vault, settlement, repo and lending programs take **plain Token-2022 mints only**. Their token
+transfers do not forward a transfer hook's extra accounts, so a mint whose transfer hook is
+`psol-compliance` cannot be deposited or swapped through them today. They gate on KYC with their
+own record checks instead.
+
 ## Quickstart
 
 Each quickstart loads only the programs it uses into [LiteSVM](https://github.com/LiteSVM/litesvm),
@@ -117,14 +122,18 @@ the caller passes:
   compliance program to be the one both vaults use (`0x4005`/`0x5005`, `0x5006`). Its margin
   check counts only positions owned by that vault program.
 
+Vault and settlement also check every token account they move tokens through: the vault's own
+account must be held by the vault PDA for that mint (`0x300E`), and DvP escrows must be held by
+the ticket and each destination by the party it pays (`0x2018`).
+
 One thing this does not cover: anyone can call `init_vault` for a mint first and choose its
 registry. Initialise your vaults right after deploying, and check `Vault::compliance_program`
 before depositing into a vault you did not create.
 
 ## How the parts fit: a prime broker
 
-Together the parts make a small prime broker. `psol-compliance` is the registry; issuers' mints
-can point their transfer hook at it. Participants deposit into one `psol-vault` per asset. Two
+Together the parts make a small prime broker. `psol-compliance` is the registry. Participants
+deposit into one `psol-vault` per asset (plain Token-2022 mints; see the note under the table). Two
 participants can then lock positions for a repo (`psol-repo`), open a term loan whose collateral
 is valued with per-asset-class haircuts and oracle prices (`psol-lending`, reading `RiskParams`
 and `PriceFeed`s from the registry), or swap an asset for cash outright (`psol-settlement`). The
@@ -138,7 +147,7 @@ the prime broker on Reth in rdk, and a sibling to
 
 ```bash
 ./scripts/build-sbf.sh       # every program to target/deploy/*.so (the e2e tests load these)
-cargo test --workspace       # 145 tests: unit + LiteSVM end-to-end for every part
+cargo test --workspace       # 147 tests: unit + LiteSVM end-to-end for every part
 ```
 
 ## License

@@ -579,3 +579,29 @@ fn settle_rejects_records_from_another_compliance_program() {
     assert_eq!(balance(&svm, &fx.escrow_a), fx.amount_a, "asset leg stays in escrow");
     assert_eq!(balance(&svm, &fx.escrow_b), fx.amount_b, "cash leg stays in escrow");
 }
+
+/// After both legs are funded, a third party calls `settle` with their own
+/// token accounts as both destinations. `settle` must refuse: each leg
+/// goes only to the counterparty's own account.
+#[test]
+fn settle_rejects_destinations_not_owned_by_the_parties() {
+    let Some((mut svm, payer)) = setup() else { return };
+    let fx = build_fixture(&mut svm, &payer, u64::MAX);
+    send(&mut svm, &[ix_fund(&fx.party_a.pubkey(), &fx.ticket, &fx.a_src, &fx.escrow_a, &fx.mint_a)], &[&payer, &fx.party_a]);
+    send(&mut svm, &[ix_fund(&fx.party_b.pubkey(), &fx.ticket, &fx.b_src, &fx.escrow_b, &fx.mint_b)], &[&payer, &fx.party_b]);
+
+    let thief = Keypair::new();
+    let thief_cash = create_ata(&mut svm, &payer, &fx.mint_b, &thief.pubkey());
+    let thief_asset = create_ata(&mut svm, &payer, &fx.mint_a, &thief.pubkey());
+    assert!(!try_send(
+        &mut svm,
+        &[ix_settle(
+            &fx.ticket, &fx.escrow_a, &fx.escrow_b, &thief_cash, &thief_asset,
+            &fx.mint_a, &fx.mint_b,
+            &derive_record(&fx.party_a.pubkey()), &derive_record(&fx.party_b.pubkey()),
+        )],
+        &[&payer],
+    ));
+    assert_eq!(balance(&svm, &fx.escrow_a), fx.amount_a);
+    assert_eq!(balance(&svm, &fx.escrow_b), fx.amount_b);
+}

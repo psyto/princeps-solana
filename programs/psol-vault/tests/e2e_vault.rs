@@ -778,3 +778,46 @@ fn withdraw_rejects_records_from_another_compliance_program() {
     let v: Vault = *from_bytes(&v_acc.data[..Vault::LEN]);
     assert_eq!(v.compliance_program, compliance_program_id().to_bytes());
 }
+
+/// A verified depositor "deposits" into a second token account of their
+/// own instead of the vault's. The vault must refuse: otherwise the
+/// position is credited with tokens the vault never received, and a
+/// withdraw would pay them out of other depositors' tokens.
+#[test]
+fn deposit_rejects_a_destination_the_vault_does_not_hold() {
+    let Some((mut svm, payer)) = setup() else {
+        return;
+    };
+    send(&mut svm, &[ix_initialize_registry(&payer.pubkey())], &[&payer]);
+    let mint_kp = Keypair::new();
+    create_plain_mint(&mut svm, &payer, &mint_kp, &payer.pubkey(), 6);
+    let mint = mint_kp.pubkey();
+    let depositor = Keypair::new();
+    svm.airdrop(&depositor.pubkey(), 1_000_000_000).unwrap();
+    let d = depositor.pubkey();
+    send(&mut svm, &[ix_register_account(&payer.pubkey(), &d)], &[&payer]);
+    send(&mut svm, &[ix_update_status(&payer.pubkey(), &d, compliance_status::VERIFIED)], &[&payer]);
+    let depositor_ata = create_user_ata(&mut svm, &payer, &mint, &d);
+    mint_to(&mut svm, &payer, &mint, &payer, &depositor_ata, 1_000_000);
+    send(&mut svm, &[ix_init_vault(&payer.pubkey(), &mint)], &[&payer]);
+    create_user_ata(&mut svm, &payer, &mint, &derive_vault(&mint));
+
+    // A second account owned by the depositor, created with the system
+    // program + initialize_account3 (not the ATA, which is the source).
+    let other = Keypair::new();
+    let lamports = svm.minimum_balance_for_rent_exemption(TokenAccount::LEN);
+    let create = solana_system_interface::instruction::create_account(
+        &payer.pubkey(), &other.pubkey(), lamports, TokenAccount::LEN as u64, &spl_token_2022::ID,
+    );
+    let init = spl_token_2022::instruction::initialize_account3(&spl_token_2022::ID, &other.pubkey(), &mint, &d).unwrap();
+    send(&mut svm, &[create, init], &[&payer, &other]);
+
+    let res = try_send(
+        &mut svm,
+        &[ix_deposit(&d, &payer.pubkey(), &mint, &depositor_ata, &other.pubkey(), 500_000)],
+        &[&payer, &depositor],
+    );
+    let err = format!("{:?}", res.expect_err("deposit into the depositor's own account must reject"));
+    assert!(err.contains(&format!("Custom({})", 0x300E)), "expected TOKEN_ACCOUNT_MISMATCH, got {err}");
+    assert_eq!(balance(&svm, &depositor_ata), 1_000_000);
+}

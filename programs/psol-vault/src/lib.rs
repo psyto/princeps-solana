@@ -124,6 +124,9 @@ pub mod err {
     /// `init_vault`'s compliance program account is not an executable
     /// program.
     pub const COMPLIANCE_PROGRAM_NOT_EXECUTABLE: ProgramError = ProgramError::Custom(0x300D);
+    /// The vault-side token account is not a Token-2022 account for this
+    /// mint owned by the vault PDA.
+    pub const TOKEN_ACCOUNT_MISMATCH: ProgramError = ProgramError::Custom(0x300E);
 
     // Compliance failures (mirror `CheckError`, distinct from
     // psol-compliance's 0x10XX and the wrapper's 0x20XX).
@@ -331,6 +334,11 @@ fn deposit(
         depositor_ai.key(),
     )?;
 
+    // The destination must be held by the vault PDA; otherwise a
+    // depositor could "deposit" into another account of their own, get
+    // the position credit, and withdraw other depositors' tokens.
+    require_token_account(vault_ata_ai, mint_ai.key(), vault_ai.key())?;
+
     // CPI Token-2022 transfer_checked from depositor_ata to vault_ata,
     // signed by the depositor (authority on the source).
     let decimals = read_mint_decimals(mint_ai)?;
@@ -459,6 +467,8 @@ fn withdraw(
             return Err(err::INSUFFICIENT_AVAILABLE);
         }
     }
+
+    require_token_account(vault_ata_ai, mint_ai.key(), vault_ai.key())?;
 
     // CPI Token-2022 transfer_checked vault_ata → depositor_ata,
     // signed as the vault PDA.
@@ -932,6 +942,23 @@ fn init_position(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
 fn require_signer(ai: &AccountInfo) -> ProgramResult {
     if !ai.is_signer() {
         return Err(err::MISSING_SIGNER);
+    }
+    Ok(())
+}
+
+/// A Token-2022 token account for `mint` whose owner (authority) is
+/// `owner`. Token account layout: mint at [0..32], owner at [32..64].
+fn require_token_account(
+    ai: &AccountInfo,
+    mint: &[u8; 32],
+    owner: &[u8; 32],
+) -> ProgramResult {
+    if ai.owner() != &TOKEN_2022_PROGRAM_ID {
+        return Err(err::TOKEN_ACCOUNT_MISMATCH);
+    }
+    let data = ai.try_borrow_data()?;
+    if data.len() < 165 || &data[0..32] != mint || &data[32..64] != owner {
+        return Err(err::TOKEN_ACCOUNT_MISMATCH);
     }
     Ok(())
 }

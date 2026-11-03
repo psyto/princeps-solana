@@ -118,6 +118,12 @@ pub mod err {
     pub const INSTRUCTION_DATA_TOO_SHORT: ProgramError = ProgramError::Custom(0x3009);
     pub const MISSING_SIGNER: ProgramError = ProgramError::Custom(0x300A);
     pub const MINT_LAYOUT_INVALID: ProgramError = ProgramError::Custom(0x300B);
+    /// The compliance program passed in is not the one this vault was
+    /// initialised with (`Vault::compliance_program`).
+    pub const COMPLIANCE_PROGRAM_MISMATCH: ProgramError = ProgramError::Custom(0x300C);
+    /// `init_vault`'s compliance program account is not an executable
+    /// program.
+    pub const COMPLIANCE_PROGRAM_NOT_EXECUTABLE: ProgramError = ProgramError::Custom(0x300D);
 
     // Compliance failures (mirror `CheckError`, distinct from
     // psol-compliance's 0x10XX and the wrapper's 0x20XX).
@@ -187,17 +193,23 @@ pub fn process_instruction(
 ///   [1, write]          vault PDA (to be created at `[seeds::VAULT, mint]`)
 ///   [2, read]           mint (must be owned by Token-2022)
 ///   [3, read]           system_program
+///   [4, read]           compliance program — every later compliance
+///                       check on this vault requires records owned by
+///                       this program (`Vault::compliance_program`)
 ///
 /// Instruction data (after the 1-byte discriminator):
 ///   [0..1] optional asset_class byte (see `psol_types::asset_class`).
 ///          Omitted → defaults to `UNKNOWN`, which receives zero
 ///          credit in any margin view (`haircut_bps` returns 10_000).
 fn init_vault(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    let [admin_ai, vault_ai, mint_ai, _system_ai] = match accounts {
-        [a, v, m, s, ..] => [a, v, m, s],
+    let [admin_ai, vault_ai, mint_ai, _system_ai, compliance_program_ai] = match accounts {
+        [a, v, m, s, cp, ..] => [a, v, m, s, cp],
         _ => return Err(ProgramError::NotEnoughAccountKeys),
     };
     require_signer(admin_ai)?;
+    if !compliance_program_ai.executable() {
+        return Err(err::COMPLIANCE_PROGRAM_NOT_EXECUTABLE);
+    }
     if mint_ai.owner() != &TOKEN_2022_PROGRAM_ID {
         return Err(err::TOKEN_PROGRAM_MISMATCH);
     }
@@ -233,7 +245,14 @@ fn init_vault(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pro
     let mut data = vault_ai.try_borrow_mut_data()?;
     let v: &mut Vault = bytemuck::try_from_bytes_mut(&mut data[..Vault::LEN])
         .map_err(|_| err::VAULT_LAYOUT_INVALID)?;
-    *v = Vault::initial(*admin_ai.key(), mint_key, slot, bump, asset_class);
+    *v = Vault::initial(
+        *admin_ai.key(),
+        mint_key,
+        slot,
+        bump,
+        asset_class,
+        *compliance_program_ai.key(),
+    );
 
     msg!("psol-vault: init_vault");
     Ok(())
@@ -297,10 +316,10 @@ fn deposit(
     }
 
     // Vault + mint consistency.
-    let (vault_data_mint, vault_bump) = read_vault(vault_ai, mint_ai, program_id)?;
-    let _ = vault_data_mint;
+    let (_vault_mint, vault_bump, vault_compliance) = read_vault(vault_ai, mint_ai, program_id)?;
 
     // Compliance check against the depositor's record.
+    require_compliance_program(&vault_compliance, compliance_program_ai)?;
     verify_record(record_ai, compliance_program_ai.key(), depositor_ai.key())?;
 
     // Idempotently create the position PDA on first deposit.
@@ -421,13 +440,14 @@ fn withdraw(
     }
 
     // Vault + position binding.
-    let (_vault_mint, vault_bump) = read_vault(vault_ai, mint_ai, program_id)?;
+    let (_vault_mint, vault_bump, vault_compliance) = read_vault(vault_ai, mint_ai, program_id)?;
     verify_position(
         position_ai,
         vault_ai.key(),
         depositor_ai.key(),
         program_id,
     )?;
+    require_compliance_program(&vault_compliance, compliance_program_ai)?;
     verify_record(record_ai, compliance_program_ai.key(), depositor_ai.key())?;
 
     // Pre-flight: enough available?
@@ -531,6 +551,8 @@ fn lock_position(
     new_authority.copy_from_slice(&data[8..40]);
 
     require_signer(depositor_ai)?;
+    let vault_compliance = read_vault_compliance(vault_ai, program_id)?;
+    require_compliance_program(&vault_compliance, compliance_program_ai)?;
     verify_record(record_ai, compliance_program_ai.key(), depositor_ai.key())?;
     verify_position(
         position_ai,
@@ -915,12 +937,16 @@ fn require_signer(ai: &AccountInfo) -> ProgramResult {
 }
 
 /// Read the vault and verify its PDA derivation + mint binding. Returns
-/// `(mint_pubkey_inside_vault, bump)` for the caller to use.
+/// `(mint_pubkey_inside_vault, bump, compliance_program)` for the caller
+/// to use.
 fn read_vault(
     vault_ai: &AccountInfo,
     mint_ai: &AccountInfo,
     program_id: &Pubkey,
-) -> Result<([u8; 32], u8), ProgramError> {
+) -> Result<([u8; 32], u8, [u8; 32]), ProgramError> {
+    if vault_ai.owner() != program_id {
+        return Err(err::VAULT_PDA_MISMATCH);
+    }
     let data = vault_ai.try_borrow_data()?;
     if data.len() < Vault::LEN {
         return Err(err::VAULT_LAYOUT_INVALID);
@@ -936,7 +962,44 @@ fn read_vault(
     if &expected != vault_ai.key() {
         return Err(err::VAULT_PDA_MISMATCH);
     }
-    Ok((v.mint, v.bump))
+    Ok((v.mint, v.bump, v.compliance_program))
+}
+
+/// Read a vault whose mint account is not passed in (`lock_position`):
+/// verify ownership and PDA derivation from its own `mint` field, and
+/// return the compliance program it was initialised with.
+fn read_vault_compliance(
+    vault_ai: &AccountInfo,
+    program_id: &Pubkey,
+) -> Result<[u8; 32], ProgramError> {
+    if vault_ai.owner() != program_id {
+        return Err(err::VAULT_PDA_MISMATCH);
+    }
+    let data = vault_ai.try_borrow_data()?;
+    if data.len() < Vault::LEN {
+        return Err(err::VAULT_LAYOUT_INVALID);
+    }
+    let v: &Vault =
+        bytemuck::try_from_bytes(&data[..Vault::LEN]).map_err(|_| err::VAULT_LAYOUT_INVALID)?;
+    let expected = create_program_address(&[seeds::VAULT, &v.mint, &[v.bump]], program_id)
+        .map_err(|_| err::VAULT_PDA_MISMATCH)?;
+    if &expected != vault_ai.key() {
+        return Err(err::VAULT_PDA_MISMATCH);
+    }
+    Ok(v.compliance_program)
+}
+
+/// The compliance program passed in must be the one the vault was
+/// initialised with; otherwise a caller could pass a program of their
+/// own that owns forged `AccountRecord`s.
+fn require_compliance_program(
+    vault_compliance: &[u8; 32],
+    compliance_program_ai: &AccountInfo,
+) -> ProgramResult {
+    if compliance_program_ai.key() != vault_compliance {
+        return Err(err::COMPLIANCE_PROGRAM_MISMATCH);
+    }
+    Ok(())
 }
 
 /// Verify the position PDA derivation + its `vault` / `depositor`

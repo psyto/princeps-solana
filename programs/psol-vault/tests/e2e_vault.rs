@@ -265,6 +265,7 @@ fn ix_init_vault(admin: &Address, mint: &Address) -> Instruction {
             AccountMeta::new(derive_vault(mint), false),
             AccountMeta::new_readonly(*mint, false),
             AccountMeta::new_readonly(solana_system_interface::program::ID, false),
+            AccountMeta::new_readonly(compliance_program_id(), false),
         ],
         data: vec![vault_ix::INIT_VAULT],
     }
@@ -630,6 +631,7 @@ fn ix_init_vault_with_class(admin: &Address, mint: &Address, class: u8) -> Instr
             AccountMeta::new(derive_vault(mint), false),
             AccountMeta::new_readonly(*mint, false),
             AccountMeta::new_readonly(solana_system_interface::program::ID, false),
+            AccountMeta::new_readonly(compliance_program_id(), false),
         ],
         data: vec![vault_ix::INIT_VAULT, class],
     }
@@ -674,4 +676,105 @@ fn init_vault_persists_explicit_asset_class() {
         asset_class::EQUITY,
         "explicit asset_class byte must round-trip into Vault::asset_class"
     );
+}
+
+// ─── The vault trusts only the compliance program it was initialised with ─
+
+fn rogue_compliance_program_id() -> Address {
+    Address::from([8u8; 32])
+}
+
+/// Re-target a compliance instruction built for `compliance_program_id()`
+/// at a second deployment, re-deriving the registry and record PDAs.
+fn on_rogue(mut ix: Instruction, participant: Option<&Address>) -> Instruction {
+    let rogue = rogue_compliance_program_id();
+    let registry = derive_registry();
+    let rogue_registry = Address::find_program_address(&[seeds::REGISTRY], &rogue).0;
+    let record = participant.map(derive_record);
+    let rogue_record = participant.map(|p| {
+        Address::find_program_address(&[seeds::ACCOUNT_RECORD, p.as_ref()], &rogue).0
+    });
+    ix.program_id = rogue;
+    for m in &mut ix.accounts {
+        if m.pubkey == registry {
+            m.pubkey = rogue_registry;
+        } else if Some(m.pubkey) == record {
+            m.pubkey = rogue_record.unwrap();
+        }
+    }
+    ix
+}
+
+/// A suspended depositor deploys their own copy of the compliance program,
+/// marks themselves VERIFIED there, and passes that program and record to
+/// `withdraw`. The vault must refuse: it only accepts records owned by the
+/// program it was initialised with.
+#[test]
+fn withdraw_rejects_records_from_another_compliance_program() {
+    let Some((mut svm, payer)) = setup() else {
+        return;
+    };
+    svm.add_program(
+        rogue_compliance_program_id(),
+        &std::fs::read(so_path("psol_compliance.so")).unwrap(),
+    )
+    .unwrap();
+    send(&mut svm, &[ix_initialize_registry(&payer.pubkey())], &[&payer]);
+
+    let mint_kp = Keypair::new();
+    create_plain_mint(&mut svm, &payer, &mint_kp, &payer.pubkey(), 6);
+    let mint = mint_kp.pubkey();
+
+    let depositor = Keypair::new();
+    svm.airdrop(&depositor.pubkey(), 1_000_000_000).unwrap();
+    let d = depositor.pubkey();
+    send(&mut svm, &[ix_register_account(&payer.pubkey(), &d)], &[&payer]);
+    send(
+        &mut svm,
+        &[ix_update_status(&payer.pubkey(), &d, compliance_status::VERIFIED)],
+        &[&payer],
+    );
+    let depositor_ata = create_user_ata(&mut svm, &payer, &mint, &d);
+    mint_to(&mut svm, &payer, &mint, &payer, &depositor_ata, 1_000_000);
+
+    send(&mut svm, &[ix_init_vault(&payer.pubkey(), &mint)], &[&payer]);
+    let vault = derive_vault(&mint);
+    let vault_ata = create_user_ata(&mut svm, &payer, &mint, &vault);
+    send(
+        &mut svm,
+        &[ix_deposit(&d, &payer.pubkey(), &mint, &depositor_ata, &vault_ata, 500_000)],
+        &[&payer, &depositor],
+    );
+    send(
+        &mut svm,
+        &[ix_update_status(&payer.pubkey(), &d, compliance_status::SUSPENDED)],
+        &[&payer],
+    );
+
+    // The depositor's own registry, where they are VERIFIED.
+    send(
+        &mut svm,
+        &[
+            on_rogue(ix_initialize_registry(&d), None),
+            on_rogue(ix_register_account(&d, &d), Some(&d)),
+            on_rogue(ix_update_status(&d, &d, compliance_status::VERIFIED), Some(&d)),
+        ],
+        &[&depositor],
+    );
+
+    let mut ix = ix_withdraw(&d, &mint, &vault_ata, &depositor_ata, 500_000);
+    ix.accounts[1].pubkey =
+        Address::find_program_address(&[seeds::ACCOUNT_RECORD, d.as_ref()], &rogue_compliance_program_id()).0;
+    ix.accounts[2].pubkey = rogue_compliance_program_id();
+    let res = try_send(&mut svm, &[ix], &[&payer, &depositor]);
+    let err = format!("{:?}", res.expect_err("withdraw must reject a record from another program"));
+    assert!(
+        err.contains(&format!("Custom({})", 0x300C)),
+        "expected COMPLIANCE_PROGRAM_MISMATCH, got {err}"
+    );
+    assert_eq!(balance(&svm, &vault_ata), 500_000, "tokens stay in the vault");
+
+    let v_acc = svm.get_account(&vault).unwrap();
+    let v: Vault = *from_bytes(&v_acc.data[..Vault::LEN]);
+    assert_eq!(v.compliance_program, compliance_program_id().to_bytes());
 }

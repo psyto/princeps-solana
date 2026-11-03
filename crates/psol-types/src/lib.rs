@@ -734,11 +734,18 @@ pub struct Vault {
     pub asset_class: u8,
     /// Forward-compat slack.
     pub _reserved: [u8; 16],
+    /// The program whose `AccountRecord`s gate this vault, fixed at
+    /// `init_vault`. Every compliance check against this vault requires
+    /// the record's owner to equal this key, so a caller cannot pass a
+    /// program of their own that owns forged records. Any program that
+    /// writes `AccountRecord`-shaped accounts can be named here, not only
+    /// `psol-compliance`.
+    pub compliance_program: [u8; 32],
 }
 
 impl Vault {
     pub const LEN: usize = core::mem::size_of::<Self>();
-    pub const CURRENT_VERSION: u16 = 1;
+    pub const CURRENT_VERSION: u16 = 2;
 
     /// Construct an empty vault. Programs write the resulting bytes
     /// into the freshly-allocated PDA at `init_vault`. Pass
@@ -752,6 +759,7 @@ impl Vault {
         slot: u64,
         bump: u8,
         asset_class: u8,
+        compliance_program: [u8; 32],
     ) -> Self {
         Self {
             last_modified_slot: slot,
@@ -763,6 +771,7 @@ impl Vault {
             bump,
             asset_class,
             _reserved: [0; 16],
+            compliance_program,
         }
     }
 }
@@ -1575,7 +1584,7 @@ mod tests {
 
     #[test]
     fn vault_size_is_stable() {
-        assert_eq!(Vault::LEN, 104);
+        assert_eq!(Vault::LEN, 136);
     }
 
     #[test]
@@ -1753,7 +1762,7 @@ mod tests {
 
     #[test]
     fn vault_initial_has_expected_shape() {
-        let v = Vault::initial([1; 32], [2; 32], 100, 254, asset_class::EQUITY);
+        let v = Vault::initial([1; 32], [2; 32], 100, 254, asset_class::EQUITY, [3; 32]);
         assert_eq!(v.admin, [1; 32]);
         assert_eq!(v.mint, [2; 32]);
         assert_eq!(v.last_modified_slot, 100);
@@ -1762,6 +1771,7 @@ mod tests {
         assert_eq!(v.position_count, 0);
         assert_eq!(v.version, Vault::CURRENT_VERSION);
         assert_eq!(v.asset_class, asset_class::EQUITY);
+        assert_eq!(v.compliance_program, [3; 32]);
     }
 
     #[test]

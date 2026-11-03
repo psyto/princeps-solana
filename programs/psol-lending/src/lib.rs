@@ -338,11 +338,20 @@ fn open_loan(
     require_signer(lender_ai)?;
     require_signer(payer_ai)?;
     // We do not assert `vault_program_ai.key()` matches a hard-coded
-    // vault program ID — the wrapper is deployment-agnostic. The CPI
-    // will fail loudly if the passed program does not understand our
-    // `lock_position` / `transfer_within_vault` discriminators, and
-    // psol-vault's own owner checks on the position PDAs back-stop
-    // accidental wrong-program calls.
+    // vault program ID — the wrapper is deployment-agnostic. Instead
+    // every vault and position this call reads must be owned by the
+    // vault program it CPIs into, and the compliance program must be
+    // the one both vaults were initialised with, so the margin inputs
+    // (RiskParams, PriceFeeds, positions) cannot come from a program
+    // the caller deployed.
+    let collateral_compliance =
+        read_vault(collateral_vault_ai, vault_program_ai.key())?.compliance_program;
+    let cash_compliance = read_vault(cash_vault_ai, vault_program_ai.key())?.compliance_program;
+    if compliance_program_ai.key() != &collateral_compliance
+        || compliance_program_ai.key() != &cash_compliance
+    {
+        return Err(err::COMPLIANCE_PROGRAM_MISMATCH);
+    }
 
     // Compliance checks against both parties' records.
     verify_record(borrower_record_ai, compliance_program_ai.key(), borrower_ai.key())
@@ -379,6 +388,7 @@ fn open_loan(
     let now_slot = Clock::get()?.slot;
     enforce_margin(
         program_id,
+        vault_program_ai.key(),
         compliance_program_ai,
         risk_params_ai,
         &borrower_key,
@@ -512,10 +522,12 @@ fn repay_loan(program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> Pr
     };
     require_signer(borrower_ai)?;
     // We do not assert `vault_program_ai.key()` matches a hard-coded
-    // vault program ID — the wrapper is deployment-agnostic. The CPI
-    // will fail loudly if the passed program does not understand our
-    // discriminators, and psol-vault's own owner checks on the position
-    // PDAs back-stop accidental wrong-program calls.
+    // vault program ID — the wrapper is deployment-agnostic. Instead the
+    // vaults passed in must be the ones recorded in the Loan and must be
+    // owned by the program we CPI into; otherwise a borrower could pass
+    // a program of their own, have the "unlock" CPIs do nothing, and
+    // still flip the loan to REPAID — leaving both positions locked to
+    // a closed loan.
 
     // Decode Loan + assert PDA + lifecycle, then compute the
     // repayment amount before any CPIs run.
@@ -579,6 +591,8 @@ fn repay_loan(program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> Pr
             now,
         )
     };
+    require_recorded_vault(collateral_vault_ai, &collateral_vault_key, vault_program_ai)?;
+    require_recorded_vault(cash_vault_ai, &cash_vault_key, vault_program_ai)?;
 
     let slots_elapsed = now_slot.saturating_sub(opened_slot);
     let interest =
@@ -726,6 +740,9 @@ fn liquidate_loan(
             l.nonce,
         )
     };
+    // Same binding as `repay_loan`: the collateral vault must be the
+    // recorded one and owned by the program we CPI into.
+    require_recorded_vault(collateral_vault_ai, &collateral_vault_key, vault_program_ai)?;
 
     // CPI vault::seize_locked, Loan PDA signs as the lock authority.
     let nonce_bytes = nonce.to_le_bytes();
@@ -924,6 +941,7 @@ fn alloc_or_append_loan_list(
 #[allow(clippy::too_many_arguments)]
 fn enforce_margin(
     program_id: &Pubkey,
+    vault_program: &Pubkey,
     compliance_program_ai: &AccountInfo,
     risk_params_ai: &AccountInfo,
     borrower_key: &Pubkey,
@@ -1008,14 +1026,14 @@ fn enforce_margin(
 
     // ── 3. Walk the borrower's positions, converting each to micro-
     //    USD via its mint's PriceFeed and the haircut from RiskParams.
-    let collateral_mint = read_vault_mint(collateral_vault_ai)?;
-    let cash_mint = read_vault_mint(cash_vault_ai)?;
+    let collateral_mint = read_vault(collateral_vault_ai, vault_program)?.mint;
+    let cash_mint = read_vault(cash_vault_ai, vault_program)?.mint;
     let collateral_feed = find_feed_for_mint(price_feed_ais, &collateral_mint)?;
     let cash_feed = find_feed_for_mint(price_feed_ais, &cash_mint)?;
-    let collateral_class = read_vault_asset_class(collateral_vault_ai)?;
+    let collateral_class = read_vault(collateral_vault_ai, vault_program)?.asset_class;
     let collateral_credit =
         (10_000u128).saturating_sub(risk.haircut_for(collateral_class) as u128);
-    let cash_class = read_vault_asset_class(cash_vault_ai)?;
+    let cash_class = read_vault(cash_vault_ai, vault_program)?.asset_class;
     let cash_credit = (10_000u128).saturating_sub(risk.haircut_for(cash_class) as u128);
 
     let mut pool_usd: u128 = 0;
@@ -1026,6 +1044,7 @@ fn enforce_margin(
     pool_usd = pool_usd.saturating_add(add_position_usd(
         collateral_position_ai,
         collateral_vault_ai,
+        vault_program,
         borrower_key,
         &collateral_feed,
         collateral_credit,
@@ -1035,6 +1054,7 @@ fn enforce_margin(
     pool_usd = pool_usd.saturating_add(add_position_usd(
         borrower_cash_position_ai,
         cash_vault_ai,
+        vault_program,
         borrower_key,
         &cash_feed,
         cash_credit,
@@ -1058,13 +1078,14 @@ fn enforce_margin(
         }
         last_extra = *pos_key;
         have_last_extra = true;
-        let class = read_vault_asset_class(vault_ai)?;
+        let class = read_vault(vault_ai, vault_program)?.asset_class;
         let credit = (10_000u128).saturating_sub(risk.haircut_for(class) as u128);
-        let mint = read_vault_mint(vault_ai)?;
+        let mint = read_vault(vault_ai, vault_program)?.mint;
         let feed = find_feed_for_mint(price_feed_ais, &mint)?;
         pool_usd = pool_usd.saturating_add(add_position_usd(
             pos_ai,
             vault_ai,
+            vault_program,
             borrower_key,
             &feed,
             credit,
@@ -1153,7 +1174,7 @@ fn enforce_margin(
         if &l.cash_vault != loan_cash_vault_ai.key() {
             return Err(err::MARGIN_LOAN_SET_MISMATCH);
         }
-        let loan_cash_mint = read_vault_mint(loan_cash_vault_ai)?;
+        let loan_cash_mint = read_vault(loan_cash_vault_ai, vault_program)?.mint;
         let loan_cash_feed = find_feed_for_mint(price_feed_ais, &loan_cash_mint)?;
         let elapsed_to_mat = l.maturity_slot.saturating_sub(l.opened_slot);
         let interest = compute_simple_interest(
@@ -1228,15 +1249,38 @@ fn find_feed_for_mint(
     Err(err::PRICE_FEED_MISSING)
 }
 
-/// Read a vault account and return its `mint` field.
-fn read_vault_mint(vault_ai: &AccountInfo) -> Result<[u8; 32], ProgramError> {
+/// Read a vault account owned by `vault_program`. The owner check is
+/// what makes its `mint`, `asset_class` and `compliance_program` fields
+/// trustworthy: any program can write a `Vault`-shaped account.
+fn read_vault(vault_ai: &AccountInfo, vault_program: &Pubkey) -> Result<Vault, ProgramError> {
+    require_owned_by(vault_ai, vault_program)?;
     let data = vault_ai.try_borrow_data()?;
     if data.len() < Vault::LEN {
         return Err(err::MARGIN_POSITION_MISMATCH);
     }
     let v: &Vault = bytemuck::try_from_bytes(&data[..Vault::LEN])
         .map_err(|_| err::MARGIN_POSITION_MISMATCH)?;
-    Ok(v.mint)
+    Ok(*v)
+}
+
+/// The vault account must be the one recorded in the Loan and be owned
+/// by the vault program passed in, which pins that program for the CPIs.
+fn require_recorded_vault(
+    vault_ai: &AccountInfo,
+    recorded: &[u8; 32],
+    vault_program_ai: &AccountInfo,
+) -> ProgramResult {
+    if vault_ai.key() != recorded {
+        return Err(err::VAULT_PROGRAM_MISMATCH);
+    }
+    require_owned_by(vault_ai, vault_program_ai.key())
+}
+
+fn require_owned_by(ai: &AccountInfo, program: &Pubkey) -> ProgramResult {
+    if ai.owner() != program {
+        return Err(err::VAULT_PROGRAM_MISMATCH);
+    }
+    Ok(())
 }
 
 /// Convert a haircut-adjusted balance to micro-USD.
@@ -1288,6 +1332,7 @@ fn balance_to_micro_usd_no_haircut(
 fn add_position_usd(
     position_ai: &AccountInfo,
     vault_ai: &AccountInfo,
+    vault_program: &Pubkey,
     borrower_key: &Pubkey,
     feed: &PriceFeed,
     credit_bps: u128,
@@ -1306,6 +1351,11 @@ fn add_position_usd(
     seen_positions[*seen_count] = *pos_key;
     *seen_count += 1;
 
+    // Only the vault program writes positions; an account of the same
+    // size owned by any other program would otherwise count as margin.
+    if position_ai.owner() != vault_program || vault_ai.owner() != vault_program {
+        return Err(err::MARGIN_POSITION_MISMATCH);
+    }
     let data = position_ai.try_borrow_data()?;
     if data.len() < Position::LEN {
         return Err(err::MARGIN_POSITION_MISMATCH);
@@ -1319,20 +1369,6 @@ fn add_position_usd(
         return Err(err::MARGIN_POSITION_MISMATCH);
     }
     balance_to_micro_usd(p.available(), feed.price_micro_usd, feed.mint_decimals, credit_bps)
-}
-
-/// Read a vault's `asset_class` field. Decodes the full `Vault`
-/// struct since the field's offset isn't part of the public layout
-/// guarantees pinned by tests today; a one-time decode keeps the
-/// helper future-proof against `Vault` reordering.
-fn read_vault_asset_class(vault_ai: &AccountInfo) -> Result<u8, ProgramError> {
-    let data = vault_ai.try_borrow_data()?;
-    if data.len() < Vault::LEN {
-        return Err(err::MARGIN_POSITION_MISMATCH);
-    }
-    let v: &Vault = bytemuck::try_from_bytes(&data[..Vault::LEN])
-        .map_err(|_| err::MARGIN_POSITION_MISMATCH)?;
-    Ok(v.asset_class)
 }
 
 /// Validate a position belongs to the borrower and references the

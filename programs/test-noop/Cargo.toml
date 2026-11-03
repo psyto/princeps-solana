@@ -1,0 +1,13 @@
+[package]
+name = "test-noop"
+description = "Test-only program that accepts any instruction and does nothing. Used to stand in for a caller-supplied program in negative tests."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+pinocchio = { workspace = true }

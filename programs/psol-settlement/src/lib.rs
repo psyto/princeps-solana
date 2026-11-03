@@ -7,7 +7,8 @@
 //! accounts are owned by it — no external settlement channel is required.
 //!
 //! Instructions:
-//!   * `create_swap` — initialize a `SwapTicket` PDA for (a, b, mint_a, mint_b, nonce).
+//!   * `create_swap` — initialize a `SwapTicket` PDA for (a, b, mint_a, mint_b, nonce,
+//!                     compliance program).
 //!   * `fund`        — a party moves its leg into the ticket's escrow ATA.
 //!   * `settle`      — after both funded + compliance + not expired, atomically
 //!                     deliver escrow_a → party_b and escrow_b → party_a (PDA-signed).
@@ -79,6 +80,11 @@ pub mod err {
     pub const COMPLIANCE_SUSPENDED: ProgramError = ProgramError::Custom(0x2013);
     pub const COMPLIANCE_BLOCKED: ProgramError = ProgramError::Custom(0x2014);
     pub const RECORD_MISMATCH: ProgramError = ProgramError::Custom(0x2015);
+    /// `settle` was passed a compliance program other than the one the
+    /// ticket was created with.
+    pub const COMPLIANCE_PROGRAM_MISMATCH: ProgramError = ProgramError::Custom(0x2016);
+    /// `create_swap`'s compliance program account is not executable.
+    pub const COMPLIANCE_PROGRAM_NOT_EXECUTABLE: ProgramError = ProgramError::Custom(0x2017);
 }
 
 /// On-chain swap ticket. `repr(C)` + `Pod`: the byte layout is the contract.
@@ -100,6 +106,9 @@ pub struct SwapTicket {
     pub amount_b: u64,
     pub expiry_slot: u64,
     pub nonce: u64,
+    /// The program whose `AccountRecord`s gate `settle`, fixed at
+    /// `create_swap` and part of the ticket's PDA seeds.
+    pub compliance_program: [u8; 32],
 }
 
 impl SwapTicket {
@@ -131,16 +140,23 @@ pub fn process_instruction(
 //   [0, signer, write] payer
 //   [1, write]         ticket PDA (uninitialized)
 //   [2]                system_program
+//   [3]                compliance program — `settle` accepts only records
+//                      owned by it; part of the ticket's PDA seeds, so the
+//                      parties' expected ticket address commits to it
 //
 // Data: party_a(32) party_b(32) mint_a(32) mint_b(32)
 //       amount_a(8) amount_b(8) decimals_a(1) decimals_b(1)
 //       expiry_slot(8) nonce(8)   = 162 bytes
 fn create_swap(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    let [payer_ai, ticket_ai, _system_ai] = match accounts {
-        [p, t, s, ..] => [p, t, s],
+    let [payer_ai, ticket_ai, _system_ai, compliance_program_ai] = match accounts {
+        [p, t, s, cp, ..] => [p, t, s, cp],
         _ => return Err(ProgramError::NotEnoughAccountKeys),
     };
     require_signer(payer_ai)?;
+    if !compliance_program_ai.executable() {
+        return Err(err::COMPLIANCE_PROGRAM_NOT_EXECUTABLE);
+    }
+    let compliance_program = *compliance_program_ai.key();
     if data.len() < 162 {
         return Err(err::DATA_TOO_SHORT);
     }
@@ -157,7 +173,7 @@ fn create_swap(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
 
     let nonce_le = nonce.to_le_bytes();
     let (expected, bump) = find_program_address(
-        &[DVP, &party_a, &party_b, &mint_a, &mint_b, &nonce_le],
+        &[DVP, &party_a, &party_b, &mint_a, &mint_b, &nonce_le, &compliance_program],
         program_id,
     );
     if &expected != ticket_ai.key() {
@@ -173,6 +189,7 @@ fn create_swap(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         Seed::from(&mint_a[..]),
         Seed::from(&mint_b[..]),
         Seed::from(&nonce_le[..]),
+        Seed::from(&compliance_program[..]),
         Seed::from(&bump_seed[..]),
     ];
     let pda_signer = Signer::from(&pda_seeds);
@@ -204,6 +221,7 @@ fn create_swap(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         amount_b,
         expiry_slot,
         nonce,
+        compliance_program,
     };
     msg!("psol-settlement: create_swap");
     Ok(())
@@ -316,7 +334,11 @@ fn settle(program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> Progra
         return Err(err::MINT_MISMATCH);
     }
 
-    // Both parties must currently pass compliance.
+    // Both parties must currently pass compliance, against the registry
+    // the ticket was created with.
+    if compliance_program_ai.key() != &t.compliance_program {
+        return Err(err::COMPLIANCE_PROGRAM_MISMATCH);
+    }
     verify_record(record_a_ai, compliance_program_ai.key(), &t.party_a)?;
     verify_record(record_b_ai, compliance_program_ai.key(), &t.party_b)?;
 
@@ -330,10 +352,20 @@ fn settle(program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> Progra
         Seed::from(&t.mint_a[..]),
         Seed::from(&t.mint_b[..]),
         Seed::from(&nonce_le[..]),
+        Seed::from(&t.compliance_program[..]),
         Seed::from(&bump_seed[..]),
     ];
     let expected = pinocchio::pubkey::create_program_address(
-        &[DVP, &t.party_a, &t.party_b, &t.mint_a, &t.mint_b, &nonce_le, &bump_seed],
+        &[
+            DVP,
+            &t.party_a,
+            &t.party_b,
+            &t.mint_a,
+            &t.mint_b,
+            &nonce_le,
+            &t.compliance_program,
+            &bump_seed,
+        ],
         program_id,
     )?;
     if &expected != ticket_ai.key() {
@@ -419,10 +451,20 @@ fn reclaim(program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> Progr
         Seed::from(&t.mint_a[..]),
         Seed::from(&t.mint_b[..]),
         Seed::from(&nonce_le[..]),
+        Seed::from(&t.compliance_program[..]),
         Seed::from(&bump_seed[..]),
     ];
     let expected = pinocchio::pubkey::create_program_address(
-        &[DVP, &t.party_a, &t.party_b, &t.mint_a, &t.mint_b, &nonce_le, &bump_seed],
+        &[
+            DVP,
+            &t.party_a,
+            &t.party_b,
+            &t.mint_a,
+            &t.mint_b,
+            &nonce_le,
+            &t.compliance_program,
+            &bump_seed,
+        ],
         program_id,
     )?;
     if &expected != ticket_ai.key() {
@@ -549,8 +591,9 @@ mod tests {
 
     #[test]
     fn ticket_layout_is_pod_and_roundtrips() {
-        // 8 (u8 header + pad) + 128 (4×[u8;32]) + 32 (4×u64) = 168, u64-aligned.
-        assert_eq!(SwapTicket::LEN, 168);
+        // 8 (u8 header + pad) + 128 (4×[u8;32]) + 32 (4×u64) + 32
+        // (compliance_program) = 200, u64-aligned.
+        assert_eq!(SwapTicket::LEN, 200);
         let t = SwapTicket {
             bump: 7,
             funded_a: 1,
@@ -567,6 +610,7 @@ mod tests {
             amount_b: 222,
             expiry_slot: 333,
             nonce: 444,
+            compliance_program: [5; 32],
         };
         let bytes = bytemuck::bytes_of(&t);
         assert_eq!(bytes.len(), SwapTicket::LEN);
@@ -599,6 +643,8 @@ mod tests {
             err::COMPLIANCE_SUSPENDED,
             err::COMPLIANCE_BLOCKED,
             err::RECORD_MISMATCH,
+            err::COMPLIANCE_PROGRAM_MISMATCH,
+            err::COMPLIANCE_PROGRAM_NOT_EXECUTABLE,
         ];
         let raw = |e: &ProgramError| match e {
             ProgramError::Custom(c) => *c,

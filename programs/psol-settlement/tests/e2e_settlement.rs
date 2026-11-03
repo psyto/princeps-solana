@@ -111,7 +111,15 @@ fn derive_ata(owner: &Address, mint: &Address) -> Address {
 fn derive_ticket(a: &Address, b: &Address, ma: &Address, mb: &Address, nonce: u64) -> Address {
     let n = nonce.to_le_bytes();
     Address::find_program_address(
-        &[psol_settlement::DVP, a.as_ref(), b.as_ref(), ma.as_ref(), mb.as_ref(), &n],
+        &[
+            psol_settlement::DVP,
+            a.as_ref(),
+            b.as_ref(),
+            ma.as_ref(),
+            mb.as_ref(),
+            &n,
+            compliance_program_id().as_ref(),
+        ],
         &settlement_program_id(),
     )
     .0
@@ -262,6 +270,7 @@ fn ix_create_swap(
             AccountMeta::new(*payer, true),
             AccountMeta::new(*ticket, false),
             AccountMeta::new_readonly(solana_system_interface::program::ID, false),
+            AccountMeta::new_readonly(compliance_program_id(), false),
         ],
         data,
     }
@@ -519,4 +528,54 @@ fn reclaim_refunds_funded_leg_after_expiry() {
     );
     assert_eq!(balance(&svm, &fx.escrow_a), 0);
     assert_eq!(balance(&svm, &fx.a_src), fx.amount_a);
+}
+
+/// A suspended party deploys their own copy of the compliance program,
+/// marks both parties VERIFIED there, and settles with those records. The
+/// ticket was created against the real registry, so `settle` must refuse.
+#[test]
+fn settle_rejects_records_from_another_compliance_program() {
+    let Some((mut svm, payer)) = setup() else { return };
+    let rogue = Address::from([8u8; 32]);
+    svm.add_program(rogue, &std::fs::read(so_path("psol_compliance.so")).unwrap())
+        .unwrap();
+    let fx = build_fixture(&mut svm, &payer, u64::MAX);
+    send(&mut svm, &[ix_fund(&fx.party_a.pubkey(), &fx.ticket, &fx.a_src, &fx.escrow_a, &fx.mint_a)], &[&payer, &fx.party_a]);
+    send(&mut svm, &[ix_fund(&fx.party_b.pubkey(), &fx.ticket, &fx.b_src, &fx.escrow_b, &fx.mint_b)], &[&payer, &fx.party_b]);
+    send(&mut svm, &[ix_update_status(&payer.pubkey(), &fx.party_a.pubkey(), compliance_status::SUSPENDED)], &[&payer]);
+
+    // party_a's own registry, where both parties are VERIFIED.
+    let a = fx.party_a.pubkey();
+    let rogue_registry = Address::find_program_address(&[seeds::REGISTRY], &rogue).0;
+    let rogue_record =
+        |p: &Address| Address::find_program_address(&[seeds::ACCOUNT_RECORD, p.as_ref()], &rogue).0;
+    let retarget = |mut ix: Instruction, p: Option<&Address>| {
+        ix.program_id = rogue;
+        for m in &mut ix.accounts {
+            if m.pubkey == derive_registry() {
+                m.pubkey = rogue_registry;
+            } else if let Some(p) = p {
+                if m.pubkey == derive_record(p) {
+                    m.pubkey = rogue_record(p);
+                }
+            }
+        }
+        ix
+    };
+    let mut ixs = vec![retarget(ix_initialize_registry(&a), None)];
+    for p in [fx.party_a.pubkey(), fx.party_b.pubkey()] {
+        ixs.push(retarget(ix_register_account(&a, &p), Some(&p)));
+        ixs.push(retarget(ix_update_status(&a, &p, compliance_status::VERIFIED), Some(&p)));
+    }
+    send(&mut svm, &ixs, &[&fx.party_a]);
+
+    let mut ix = ix_settle(
+        &fx.ticket, &fx.escrow_a, &fx.escrow_b, &fx.a_dst, &fx.b_dst,
+        &fx.mint_a, &fx.mint_b,
+        &rogue_record(&fx.party_a.pubkey()), &rogue_record(&fx.party_b.pubkey()),
+    );
+    ix.accounts[9].pubkey = rogue;
+    assert!(!try_send(&mut svm, &[ix], &[&payer]), "settle must reject another program's records");
+    assert_eq!(balance(&svm, &fx.escrow_a), fx.amount_a, "asset leg stays in escrow");
+    assert_eq!(balance(&svm, &fx.escrow_b), fx.amount_b, "cash leg stays in escrow");
 }

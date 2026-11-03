@@ -294,6 +294,7 @@ fn ix_init_vault(admin: &Address, mint: &Address) -> Instruction {
             AccountMeta::new(derive_vault(mint), false),
             AccountMeta::new_readonly(*mint, false),
             AccountMeta::new_readonly(solana_system_interface::program::ID, false),
+            AccountMeta::new_readonly(compliance_program_id(), false),
         ],
         data: vec![vault_ix::INIT_VAULT],
     }
@@ -621,4 +622,59 @@ fn vault_ix_discriminator_drift_check() {
     assert_eq!(vault_ix::WITHDRAW, 2);
     assert_eq!(vault_ix::LOCK_POSITION, 3);
     assert_eq!(vault_ix::UNLOCK_POSITION, 4);
+}
+
+/// A borrower closes with a program of their own as the vault program,
+/// so the two "unlock" CPIs do nothing. Without the binding to the
+/// recorded vaults' owner, the repo would flip to CLOSED and both
+/// positions would stay locked to a closed repo — the lender's cash
+/// stuck for good.
+#[test]
+fn close_repo_rejects_a_vault_program_that_does_not_own_the_vaults() {
+    let Some((mut svm, payer)) = setup() else {
+        return;
+    };
+    let noop = Address::from([6u8; 32]);
+    svm.add_program(noop, &std::fs::read(so_path("test_noop.so")).unwrap())
+        .unwrap();
+    let f = setup_fixture(&mut svm, payer);
+    let nonce = 1u64;
+    send(
+        &mut svm,
+        &[ix_open_repo(
+            &f.borrower.pubkey(),
+            &f.lender.pubkey(),
+            &f.payer.pubkey(),
+            &f.collateral_mint,
+            &f.cash_mint,
+            300_000,
+            200_000,
+            u64::MAX,
+            nonce,
+        )],
+        &[&f.payer, &f.borrower, &f.lender],
+    );
+
+    let mut ix = ix_close_repo(
+        &f.borrower.pubkey(),
+        &f.lender.pubkey(),
+        &f.collateral_mint,
+        &f.cash_mint,
+        nonce,
+    );
+    ix.accounts[1].pubkey = noop;
+    let res = try_send(&mut svm, &[ix], &[&f.payer, &f.borrower]);
+    let err = format!("{:?}", res.expect_err("close must reject a vault program that owns nothing"));
+    assert!(err.contains(&format!("Custom({})", 0x4005)), "expected VAULT_PROGRAM_MISMATCH, got {err}");
+
+    let repo = derive_repo(
+        &f.borrower.pubkey(),
+        &f.lender.pubkey(),
+        &derive_vault(&f.collateral_mint),
+        &derive_vault(&f.cash_mint),
+        nonce,
+    );
+    let r_acc = svm.get_account(&repo).unwrap();
+    let r: &Repo = from_bytes(&r_acc.data[..Repo::LEN]);
+    assert_eq!(r.status, repo_status::OPEN, "repo stays open");
 }

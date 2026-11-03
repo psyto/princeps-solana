@@ -162,11 +162,12 @@ fn open_repo(
     require_signer(lender_ai)?;
     require_signer(payer_ai)?;
     // We do not assert `vault_program_ai.key()` matches a hard-coded
-    // vault program ID — the wrapper is deployment-agnostic. The CPI
-    // will fail loudly if the passed program does not understand our
-    // `lock_position` / `unlock_position` discriminators, and
-    // psol-vault's own owner checks on the position PDA back-stop
-    // accidental wrong-program calls.
+    // vault program ID — the wrapper is deployment-agnostic. Both vaults
+    // must be owned by the program we CPI into; its `lock_position` then
+    // checks the records against the compliance program each vault was
+    // initialised with.
+    require_owned_by(collateral_vault_ai, vault_program_ai.key())?;
+    require_owned_by(cash_vault_ai, vault_program_ai.key())?;
 
     // Compliance checks against both parties' records.
     verify_record(borrower_record_ai, compliance_program_ai.key(), borrower_ai.key())
@@ -289,11 +290,11 @@ fn close_repo(program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> Pr
     };
     require_signer(borrower_ai)?;
     // We do not assert `vault_program_ai.key()` matches a hard-coded
-    // vault program ID — the wrapper is deployment-agnostic. The CPI
-    // will fail loudly if the passed program does not understand our
-    // `lock_position` / `unlock_position` discriminators, and
-    // psol-vault's own owner checks on the position PDA back-stop
-    // accidental wrong-program calls.
+    // vault program ID — the wrapper is deployment-agnostic. Instead the
+    // vaults passed in must be the ones recorded in the Repo and owned by
+    // the program we CPI into (checked below, after the Repo is decoded);
+    // otherwise a borrower could pass a program of their own, have the
+    // "unlock" CPIs do nothing, and still flip the repo to CLOSED.
 
     // Decode Repo + assert PDA + lifecycle.
     let (collateral_amount, cash_amount, repo_bump, borrower_key, lender_key, collateral_vault_key, cash_vault_key, nonce) = {
@@ -341,6 +342,8 @@ fn close_repo(program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> Pr
             r.nonce,
         )
     };
+    require_recorded_vault(collateral_vault_ai, &collateral_vault_key, vault_program_ai)?;
+    require_recorded_vault(cash_vault_ai, &cash_vault_key, vault_program_ai)?;
 
     // CPI vault::unlock_position twice, signing as the Repo PDA.
     let nonce_bytes = nonce.to_le_bytes();
@@ -491,6 +494,26 @@ fn cpi_unlock_position(
 }
 
 // ─── Test stubs ─────────────────────────────────────────────────────────-
+
+/// The vault account must be the one recorded in the Repo and be owned
+/// by the vault program passed in, which pins that program for the CPIs.
+fn require_recorded_vault(
+    vault_ai: &AccountInfo,
+    recorded: &[u8; 32],
+    vault_program_ai: &AccountInfo,
+) -> ProgramResult {
+    if vault_ai.key() != recorded {
+        return Err(err::VAULT_PROGRAM_MISMATCH);
+    }
+    require_owned_by(vault_ai, vault_program_ai.key())
+}
+
+fn require_owned_by(ai: &AccountInfo, program: &Pubkey) -> ProgramResult {
+    if ai.owner() != program {
+        return Err(err::VAULT_PROGRAM_MISMATCH);
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

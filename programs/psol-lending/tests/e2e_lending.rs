@@ -357,6 +357,7 @@ fn ix_init_vault(admin: &Address, mint: &Address, asset_class: u8) -> Instructio
             AccountMeta::new(derive_vault(mint), false),
             AccountMeta::new_readonly(*mint, false),
             AccountMeta::new_readonly(solana_system_interface::program::ID, false),
+            AccountMeta::new_readonly(compliance_program_id(), false),
         ],
         // Phase 4 v1b: pass an explicit asset_class so the margin
         // gate sees real haircut credit. UNKNOWN (0) returns 10_000
@@ -1628,4 +1629,63 @@ fn vault_ix_discriminator_drift_check() {
     assert_eq!(vault_ix::WITHDRAW, 2);
     assert_eq!(vault_ix::LOCK_POSITION, 3);
     assert_eq!(vault_ix::UNLOCK_POSITION, 4);
+}
+
+/// A borrower repays with a program of their own as the vault program, so
+/// the "pay the lender" and "unlock collateral" CPIs do nothing. Without
+/// the binding to the recorded vaults' owner, the loan would flip to
+/// REPAID with the lender unpaid and the collateral locked to a closed
+/// loan, out of the lender's reach.
+#[test]
+fn repay_loan_rejects_a_vault_program_that_does_not_own_the_vaults() {
+    let Some((mut svm, payer)) = setup() else {
+        return;
+    };
+    let noop = Address::from([6u8; 32]);
+    svm.add_program(noop, &std::fs::read(so_path("test_noop.so")).unwrap())
+        .unwrap();
+    let f = setup_fixture(&mut svm, payer);
+    let nonce = 1u64;
+    send(
+        &mut svm,
+        &[ix_open_loan(
+            &f.borrower.pubkey(),
+            &f.lender.pubkey(),
+            &f.payer.pubkey(),
+            &f.collateral_mint,
+            &f.cash_mint,
+            300_000,
+            200_000,
+            u64::MAX,
+            nonce,
+            0,
+            &[],
+            &[],
+            &[f.collateral_mint, f.cash_mint],
+            &[],
+        )],
+        &[&f.payer, &f.borrower, &f.lender],
+    );
+
+    let mut ix = ix_repay_loan(
+        &f.borrower.pubkey(),
+        &f.lender.pubkey(),
+        &f.collateral_mint,
+        &f.cash_mint,
+        nonce,
+    );
+    ix.accounts[1].pubkey = noop;
+    let res = try_send(&mut svm, &[ix], &[&f.payer, &f.borrower]);
+    let err = format!("{:?}", res.expect_err("repay must reject a vault program that owns nothing"));
+    assert!(err.contains(&format!("Custom({})", 0x5005)), "expected VAULT_PROGRAM_MISMATCH, got {err}");
+
+    let loan = derive_loan(
+        &f.borrower.pubkey(),
+        &f.lender.pubkey(),
+        &derive_vault(&f.collateral_mint),
+        &derive_vault(&f.cash_mint),
+        nonce,
+    );
+    let l: Loan = *from_bytes(&svm.get_account(&loan).unwrap().data[..Loan::LEN]);
+    assert_eq!(l.status, loan_status::OPEN, "loan stays open");
 }

@@ -108,6 +108,11 @@ or generated client.
 
 Nothing here is audited or deployed anywhere. Treat it as a reference implementation.
 
+**0.2.0 changes account layouts.** `Vault` grew from 104 to 136 bytes and `SwapTicket` from 168
+to 200, and the ticket's PDA seeds now include the compliance program. There is no in-place
+migration: accounts created by 0.1.0 do not load under 0.2.0, so a 0.1.0 deployment must be
+redeployed to a new program id, not upgraded.
+
 ## Which programs each part trusts
 
 Every part checks that the programs it relies on are the ones it was set up with, not whatever

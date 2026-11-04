@@ -58,6 +58,9 @@ pinocchio::nostd_panic_handler!();
 pub const TOKEN_2022_PROGRAM_ID: Pubkey =
     pinocchio_pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 
+/// Size of a Token-2022 mint with no extensions.
+pub const PLAIN_MINT_LEN: usize = 82;
+
 /// Token-2022 `TransferChecked` instruction discriminator.
 const TOKEN_IX_TRANSFER_CHECKED: u8 = 12;
 /// Length of the Token-2022 `TransferChecked` data payload.
@@ -127,6 +130,9 @@ pub mod err {
     /// The vault-side token account is not a Token-2022 account for this
     /// mint owned by the vault PDA.
     pub const TOKEN_ACCOUNT_MISMATCH: ProgramError = ProgramError::Custom(0x300E);
+    /// `init_vault`'s mint carries Token-2022 extensions; only plain mints
+    /// are supported.
+    pub const MINT_HAS_EXTENSIONS: ProgramError = ProgramError::Custom(0x300F);
 
     // Compliance failures (mirror `CheckError`, distinct from
     // psol-compliance's 0x10XX and the wrapper's 0x20XX).
@@ -215,6 +221,12 @@ fn init_vault(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pro
     }
     if mint_ai.owner() != &TOKEN_2022_PROGRAM_ID {
         return Err(err::TOKEN_PROGRAM_MISMATCH);
+    }
+    // Plain mints only: an extension such as a transfer fee would deliver
+    // less than the amount credited to the position, and a transfer hook
+    // needs extra accounts this program does not forward.
+    if mint_ai.data_len() != PLAIN_MINT_LEN {
+        return Err(err::MINT_HAS_EXTENSIONS);
     }
     let mint_key = *mint_ai.key();
     let (expected_vault, bump) = find_program_address(&[seeds::VAULT, &mint_key], program_id);

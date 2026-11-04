@@ -21,10 +21,11 @@ the contract. Take the one you need; the prime-broker flow they add up to is at 
 or your own. Each vault and each DvP ticket names its registry when it is created and accepts
 records from no other program.
 
-The vault, settlement, repo and lending programs take **plain Token-2022 mints only**. Their token
-transfers do not forward a transfer hook's extra accounts, so a mint whose transfer hook is
-`psol-compliance` cannot be deposited or swapped through them today. They gate on KYC with their
-own record checks instead.
+The vault, settlement, repo and lending programs take **plain Token-2022 mints only** — no
+extensions. `init_vault` (`0x300F`) and `fund` (`0x2019`) refuse any other mint: a transfer fee
+would leave less in the vault or escrow than was credited, and their token transfers do not
+forward a transfer hook's extra accounts. So a mint whose transfer hook is `psol-compliance`
+cannot go through them today; they gate on KYC with their own record checks instead.
 
 ## Quickstart
 
@@ -129,7 +130,11 @@ the caller passes:
 
 Vault and settlement also check every token account they move tokens through: the vault's own
 account must be held by the vault PDA for that mint (`0x300E`), and DvP escrows must be held by
-the ticket and each destination by the party it pays (`0x2018`).
+the ticket and each destination by the party it pays (`0x2018`). `psol-lending`'s repay must pay
+into the lender's own position (`0x5009`).
+
+A repo has no default path yet. Before its expiry only the borrower can close it; after expiry
+either party can, which unlocks both positions.
 
 One thing this does not cover: anyone can call `init_vault` for a mint first and choose its
 registry. Initialise your vaults right after deploying, and check `Vault::compliance_program`
@@ -152,7 +157,7 @@ the prime broker on Reth in rdk, and a sibling to
 
 ```bash
 ./scripts/build-sbf.sh       # every program to target/deploy/*.so (the e2e tests load these)
-cargo test --workspace       # 147 tests: unit + LiteSVM end-to-end for every part
+cargo test --workspace       # 150 tests: unit + LiteSVM end-to-end for every part
 ```
 
 ## License

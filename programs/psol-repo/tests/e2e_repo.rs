@@ -678,3 +678,36 @@ fn close_repo_rejects_a_vault_program_that_does_not_own_the_vaults() {
     let r: &Repo = from_bytes(&r_acc.data[..Repo::LEN]);
     assert_eq!(r.status, repo_status::OPEN, "repo stays open");
 }
+
+/// A repo left open past expiry must not lock both positions forever:
+/// the lender may close it then (but not before).
+#[test]
+fn lender_can_close_a_repo_only_after_expiry() {
+    let Some((mut svm, payer)) = setup() else {
+        return;
+    };
+    let f = setup_fixture(&mut svm, payer);
+    let nonce = 1u64;
+    let expiry = 100; // LiteSVM starts at slot 0
+    send(
+        &mut svm,
+        &[ix_open_repo(
+            &f.borrower.pubkey(), &f.lender.pubkey(), &f.payer.pubkey(),
+            &f.collateral_mint, &f.cash_mint, 300_000, 200_000, expiry, nonce,
+        )],
+        &[&f.payer, &f.borrower, &f.lender],
+    );
+    let lender_close = |svm: &mut LiteSVM| {
+        let mut ix = ix_close_repo(&f.borrower.pubkey(), &f.lender.pubkey(), &f.collateral_mint, &f.cash_mint, nonce);
+        ix.accounts[0].pubkey = f.lender.pubkey();
+        svm.expire_blockhash();
+        try_send(svm, &[ix], &[&f.payer, &f.lender])
+    };
+    assert!(lender_close(&mut svm).is_err(), "lender cannot close before expiry");
+
+    svm.warp_to_slot(expiry + 1);
+    lender_close(&mut svm).expect("lender closes after expiry");
+    let cp = derive_position(&derive_vault(&f.collateral_mint), &f.borrower.pubkey());
+    let cp: Position = *from_bytes(&svm.get_account(&cp).unwrap().data[..Position::LEN]);
+    assert_eq!(cp.locked_amount, 0, "borrower's collateral unlocked");
+}

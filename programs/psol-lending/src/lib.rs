@@ -99,6 +99,9 @@ pub mod err {
     pub const INSTRUCTION_DATA_TOO_SHORT: ProgramError = ProgramError::Custom(0x5004);
     pub const VAULT_PROGRAM_MISMATCH: ProgramError = ProgramError::Custom(0x5005);
     pub const COMPLIANCE_PROGRAM_MISMATCH: ProgramError = ProgramError::Custom(0x5006);
+    /// `repay_loan`'s destination position is not the lender's position in
+    /// the loan's cash vault.
+    pub const POSITION_NOT_PARTYS: ProgramError = ProgramError::Custom(0x5009);
     pub const BORROWER_RECORD_MISMATCH: ProgramError = ProgramError::Custom(0x5007);
     pub const LENDER_RECORD_MISMATCH: ProgramError = ProgramError::Custom(0x5008);
 
@@ -600,6 +603,10 @@ fn repay_loan(program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> Pr
     let total_due = principal_amount
         .checked_add(interest)
         .ok_or(err::INTEREST_OVERFLOW)?;
+
+    // The repayment must land in the lender's own position in the cash
+    // vault; the vault only checks that the destination is *a* position.
+    require_position_of(lender_cash_position_ai, &cash_vault_key, &lender_key, vault_program_ai)?;
 
     // CPI vault::transfer_within_vault from borrower's cash position
     // to lender's cash position (borrower signs).
@@ -1274,6 +1281,26 @@ fn require_recorded_vault(
         return Err(err::VAULT_PROGRAM_MISMATCH);
     }
     require_owned_by(vault_ai, vault_program_ai.key())
+}
+
+/// `position_ai` is a vault position in `vault` belonging to `owner`.
+fn require_position_of(
+    position_ai: &AccountInfo,
+    vault: &[u8; 32],
+    owner: &[u8; 32],
+    vault_program_ai: &AccountInfo,
+) -> ProgramResult {
+    require_owned_by(position_ai, vault_program_ai.key())?;
+    let data = position_ai.try_borrow_data()?;
+    if data.len() < Position::LEN {
+        return Err(err::POSITION_NOT_PARTYS);
+    }
+    let p: &Position = bytemuck::try_from_bytes(&data[..Position::LEN])
+        .map_err(|_| err::POSITION_NOT_PARTYS)?;
+    if &p.vault != vault || &p.depositor != owner {
+        return Err(err::POSITION_NOT_PARTYS);
+    }
+    Ok(())
 }
 
 fn require_owned_by(ai: &AccountInfo, program: &Pubkey) -> ProgramResult {

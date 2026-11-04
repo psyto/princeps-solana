@@ -37,6 +37,9 @@ pinocchio::nostd_panic_handler!();
 // ─── Constants ─────────────────────────────────────────────────────────────
 
 /// Token-2022 program ID.
+/// Size of a Token-2022 mint with no extensions.
+pub const PLAIN_MINT_LEN: usize = 82;
+
 pub const TOKEN_2022_PROGRAM_ID: Pubkey =
     pinocchio_pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 /// Token-2022 `TransferChecked` instruction discriminator.
@@ -89,6 +92,8 @@ pub mod err {
     /// a destination is not the right party's token account for the mint
     /// it receives.
     pub const TOKEN_ACCOUNT_MISMATCH: ProgramError = ProgramError::Custom(0x2018);
+    /// `fund`'s mint is not a plain Token-2022 mint (it has extensions).
+    pub const MINT_HAS_EXTENSIONS: ProgramError = ProgramError::Custom(0x2019);
 }
 
 /// On-chain swap ticket. `repr(C)` + `Pod`: the byte layout is the contract.
@@ -248,6 +253,11 @@ fn fund(_program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> Program
     require_signer(funder_ai)?;
     if token_program_ai.key() != &TOKEN_2022_PROGRAM_ID {
         return Err(err::TOKEN_PROGRAM_MISMATCH);
+    }
+    // Plain mints only: a transfer fee would leave less than the leg's
+    // amount in escrow, so settle and reclaim could never move it.
+    if mint_ai.owner() != &TOKEN_2022_PROGRAM_ID || mint_ai.data_len() != PLAIN_MINT_LEN {
+        return Err(err::MINT_HAS_EXTENSIONS);
     }
 
     let mut raw = ticket_ai.try_borrow_mut_data()?;
@@ -680,6 +690,7 @@ mod tests {
             err::COMPLIANCE_PROGRAM_MISMATCH,
             err::COMPLIANCE_PROGRAM_NOT_EXECUTABLE,
             err::TOKEN_ACCOUNT_MISMATCH,
+            err::MINT_HAS_EXTENSIONS,
         ];
         let raw = |e: &ProgramError| match e {
             ProgramError::Custom(c) => *c,

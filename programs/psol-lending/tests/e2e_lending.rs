@@ -1689,3 +1689,36 @@ fn repay_loan_rejects_a_vault_program_that_does_not_own_the_vaults() {
     let l: Loan = *from_bytes(&svm.get_account(&loan).unwrap().data[..Loan::LEN]);
     assert_eq!(l.status, loan_status::OPEN, "loan stays open");
 }
+
+/// The borrower repays into an accomplice's cash position instead of the
+/// lender's. `repay_loan` must refuse; otherwise the loan flips to REPAID,
+/// the collateral unlocks, and the lender is never paid.
+#[test]
+fn repay_loan_rejects_a_destination_that_is_not_the_lenders_position() {
+    let Some((mut svm, payer)) = setup() else {
+        return;
+    };
+    let f = setup_fixture(&mut svm, payer);
+    let nonce = 1u64;
+    send(
+        &mut svm,
+        &[ix_open_loan(
+            &f.borrower.pubkey(), &f.lender.pubkey(), &f.payer.pubkey(),
+            &f.collateral_mint, &f.cash_mint, 300_000, 200_000, u64::MAX, nonce, 0,
+            &[], &[], &[f.collateral_mint, f.cash_mint], &[],
+        )],
+        &[&f.payer, &f.borrower, &f.lender],
+    );
+    let accomplice = Keypair::new();
+    svm.airdrop(&accomplice.pubkey(), 1_000_000_000).unwrap();
+    send(
+        &mut svm,
+        &[ix_init_position(&accomplice.pubkey(), &f.payer.pubkey(), &f.cash_mint)],
+        &[&f.payer, &accomplice],
+    );
+    let mut ix = ix_repay_loan(&f.borrower.pubkey(), &f.lender.pubkey(), &f.collateral_mint, &f.cash_mint, nonce);
+    ix.accounts[6].pubkey = derive_position(&derive_vault(&f.cash_mint), &accomplice.pubkey());
+    let res = try_send(&mut svm, &[ix], &[&f.payer, &f.borrower]);
+    let err = format!("{:?}", res.expect_err("repay into someone else's position must reject"));
+    assert!(err.contains(&format!("Custom({})", 0x5009)), "expected POSITION_NOT_PARTYS, got {err}");
+}

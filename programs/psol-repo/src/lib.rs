@@ -264,11 +264,11 @@ fn open_repo(
 
 // ─── close_repo ─────────────────────────────────────────────────────────-
 
-/// Borrower-signed close: both positions get unlocked. Rejects after
-/// `expiry_slot` — past expiry only the Phase 3b `default_repo` (not
-/// implemented in Phase 3 minimum) is permitted.
+/// Close: both positions get unlocked. Before `expiry_slot` only the
+/// borrower may close; after it either party may, since there is no
+/// default path yet and the positions would otherwise stay locked.
 ///
-///   [0,  signer]    borrower
+///   [0,  signer]    borrower (or, after expiry, the lender)
 ///   [1,  read]      vault_program
 ///   [2,  read]      collateral_vault PDA
 ///   [3,  write]     borrower's collateral Position PDA
@@ -307,12 +307,14 @@ fn close_repo(program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> Pr
         if r.status != repo_status::OPEN {
             return Err(err::NOT_OPEN);
         }
-        if &r.borrower != borrower_ai.key() {
-            return Err(err::BORROWER_RECORD_MISMATCH);
-        }
+        // Before expiry only the borrower closes. After it, either party
+        // may: there is no default path, so otherwise both positions would
+        // stay locked to the Repo PDA for good.
         let now = Clock::get()?.slot;
-        if now > r.expiry_slot {
-            return Err(err::EXPIRED);
+        let is_borrower = &r.borrower == borrower_ai.key();
+        let is_lender = &r.lender == borrower_ai.key();
+        if !(is_borrower || (now > r.expiry_slot && is_lender)) {
+            return Err(err::BORROWER_RECORD_MISMATCH);
         }
         let nonce_bytes = r.nonce.to_le_bytes();
         let expected = create_program_address(

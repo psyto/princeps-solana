@@ -821,3 +821,29 @@ fn deposit_rejects_a_destination_the_vault_does_not_hold() {
     assert!(err.contains(&format!("Custom({})", 0x300E)), "expected TOKEN_ACCOUNT_MISMATCH, got {err}");
     assert_eq!(balance(&svm, &depositor_ata), 1_000_000);
 }
+
+/// Only plain Token-2022 mints: one with any extension (here a mint close
+/// authority; a transfer fee would under-deliver deposits) is refused.
+#[test]
+fn init_vault_rejects_a_mint_with_extensions() {
+    let Some((mut svm, payer)) = setup() else {
+        return;
+    };
+    use spl_token_2022::extension::ExtensionType;
+    let mint = Keypair::new();
+    let space = ExtensionType::try_calculate_account_len::<Mint>(&[ExtensionType::MintCloseAuthority]).unwrap();
+    let lamports = svm.minimum_balance_for_rent_exemption(space);
+    let create = solana_system_interface::instruction::create_account(
+        &payer.pubkey(), &mint.pubkey(), lamports, space as u64, &spl_token_2022::ID,
+    );
+    let close = spl_token_2022::instruction::initialize_mint_close_authority(
+        &spl_token_2022::ID, &mint.pubkey(), Some(&payer.pubkey()),
+    )
+    .unwrap();
+    let init = spl_token_2022::instruction::initialize_mint2(&spl_token_2022::ID, &mint.pubkey(), &payer.pubkey(), None, 6).unwrap();
+    send(&mut svm, &[create, close, init], &[&payer, &mint]);
+
+    let res = try_send(&mut svm, &[ix_init_vault(&payer.pubkey(), &mint.pubkey())], &[&payer]);
+    let err = format!("{:?}", res.expect_err("a mint with extensions must be refused"));
+    assert!(err.contains(&format!("Custom({})", 0x300F)), "expected MINT_HAS_EXTENSIONS, got {err}");
+}

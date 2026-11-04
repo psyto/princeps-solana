@@ -19,8 +19,11 @@ harness ([crucible#25](https://github.com/asymmetric-research/crucible/issues/25
 
 ## What it catches
 
-Setup verifies two depositors, A and B, each with a position. Each spec
-sends A's instruction with one account swapped. Measured 2026-11-04 by
+Setup verifies two depositors, A and B, each with a position, and writes
+a copy of A's record owned by a rogue program. Each spec sends A's
+instruction with one account swapped; two swap sets (solinv's
+`account_swap::check_sets`) swap the compliance program and the record
+together, in `deposit` and in `withdraw`. Measured 2026-11-04 by
 deleting one check from `programs/psol-vault/src/lib.rs` at a time
 (45-second runs):
 
@@ -30,14 +33,17 @@ deleting one check from `programs/psol-vault/src/lib.rs` at a time
 | withdraw: the destination must be the depositor's own account | yes, `withdraw` slot 7 |
 | withdraw: the position must be (vault, depositor)'s | yes, `withdraw` slot 4 |
 | `verify_record`: the record must be the signer's | yes, `deposit` slot 2 |
-| withdraw: the compliance program must be the vault's | **no** — see below |
+| withdraw: the compliance program must be the vault's | yes, `withdraw` slots 1 and 2 together (60-second run, solinv 8bcb011) |
+| deposit: the compliance program must be the vault's | yes, `deposit` slots 2 and 3 together (60-second run, solinv 8bcb011) |
 | none (current code) | 0 findings |
 
-**Not caught:** the fake-registry attack needs two accounts swapped
-together, another compliance program *and* a record it owns. solinv's
-account-swap changes one slot at a time, so swapping only the program
-fails on the record check and looks safe. The e2e test
-`withdraw_rejects_records_from_another_compliance_program` covers it.
-Likewise a suspended sender in `transfer_within_vault` is a different
+The fake-registry attack needs two accounts swapped together, another
+compliance program *and* a record it owns: swapping either alone fails
+on the other check, so one-slot swaps missed it until solinv added swap
+sets ([psyto/solinv#4](https://github.com/psyto/solinv/issues/4)). The
+e2e test `withdraw_rejects_records_from_another_compliance_program`
+covers it too.
+
+Not caught: a suspended sender in `transfer_within_vault` is a different
 signer, not a swapped account; `transfer_within_vault_rejects_a_suspended_sender`
 covers it.

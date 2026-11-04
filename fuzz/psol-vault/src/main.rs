@@ -16,6 +16,7 @@ use solana_signer::Signer;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use solinv_core::invariants::account_swap::SwapSet;
 use solinv_fuzz::{HasContext, HasInstructionSet, InstructionSpec};
 
 const COMPLIANCE_SO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/deploy/psol_compliance.so");
@@ -47,6 +48,9 @@ const START_DEPOSIT: u64 = 100_000;
 fn t22() -> Pubkey {
     Pubkey::from_str(TOKEN_2022_ID).unwrap()
 }
+/// Where the forged record lives: any key that is not a program id.
+const FORGED_RECORD: Pubkey = Pubkey::new_from_array([0x42; 32]);
+
 fn registry() -> Pubkey {
     Pubkey::find_program_address(&[b"registry"], &COMPLIANCE_ID).0
 }
@@ -286,6 +290,10 @@ impl VaultFixture {
         f.send(ix, &[&*a], "deposit A");
         let ix = f.deposit_ix(&b.pubkey(), &ba, START_DEPOSIT);
         f.send(ix, &[&*b], "deposit B");
+        // A copy of A's verified record, owned by the rogue program: the
+        // fake-registry attack swaps it in together with that program.
+        let rec = f.ctx.get_account(&record(&a.pubkey())).unwrap().data.clone();
+        f.put(FORGED_RECORD, ROGUE_ID, rec);
         f
     }
 
@@ -399,4 +407,13 @@ fn invariant_vault(fixture: &mut VaultFixture) {
     solinv_core::invariants::signer_skip::check(fixture);
     solinv_core::invariants::owner_skip::check(fixture);
     solinv_core::invariants::account_swap::check(fixture);
+    // Another compliance program and a record it owns, swapped together:
+    // each alone fails, so one-slot swaps cannot see a missing pin.
+    solinv_core::invariants::account_swap::check_sets(
+        fixture,
+        &[
+            SwapSet { ix: "deposit".into(), swaps: vec![(2, FORGED_RECORD), (3, ROGUE_ID)] },
+            SwapSet { ix: "withdraw".into(), swaps: vec![(1, FORGED_RECORD), (2, ROGUE_ID)] },
+        ],
+    );
 }

@@ -10,7 +10,8 @@
 //!      SUSPENDED party rejects; expiry → `reclaim` refunds the funded leg.
 //!
 //! Prerequisite: `psol_compliance.so` + `psol_settlement.so` under
-//! `target/deploy/` (`cargo build-sbf`). If absent, the tests SKIP.
+//! `target/deploy/` (`cargo build-sbf`). If absent, the tests fail, or
+//! skip with `PSOL_SKIP_E2E=1`.
 
 use {
     litesvm::LiteSVM,
@@ -54,7 +55,10 @@ fn setup() -> Option<(LiteSVM, Keypair)> {
         ("psol_settlement.so", so_path("psol_settlement.so")),
     ] {
         if !path.exists() {
-            eprintln!("SKIP: {label} not built. Run `cargo build-sbf` first.");
+            eprintln!("{label} not built. Run `cargo build-sbf` first.");
+            if std::env::var_os("PSOL_SKIP_E2E").is_none() {
+                panic!("SBF build missing: run ./scripts/build-sbf.sh (or set PSOL_SKIP_E2E=1 to skip)");
+            }
             return None;
         }
     }

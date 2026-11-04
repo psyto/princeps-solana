@@ -78,7 +78,10 @@ fn setup() -> Option<(LiteSVM, Keypair)> {
         ("psol_lending.so", so_path("psol_lending.so")),
     ] {
         if !path.exists() {
-            eprintln!("SKIP: {label} not built. Run `cargo build-sbf` for each program first.");
+            eprintln!("{label} not built. Run `cargo build-sbf` for each program first.");
+            if std::env::var_os("PSOL_SKIP_E2E").is_none() {
+                panic!("SBF build missing: run ./scripts/build-sbf.sh (or set PSOL_SKIP_E2E=1 to skip)");
+            }
             return None;
         }
     }

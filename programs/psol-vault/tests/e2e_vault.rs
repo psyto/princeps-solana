@@ -59,8 +59,11 @@ fn setup() -> Option<(LiteSVM, Keypair)> {
     ] {
         if !path.exists() {
             eprintln!(
-                "SKIP: {label} not built. Run `cargo build-sbf` on each program first."
+                "{label} not built. Run `cargo build-sbf` on each program first."
             );
+            if std::env::var_os("PSOL_SKIP_E2E").is_none() {
+                panic!("SBF build missing: run ./scripts/build-sbf.sh (or set PSOL_SKIP_E2E=1 to skip)");
+            }
             return None;
         }
     }
@@ -1134,7 +1137,7 @@ fn init_vault_rejects_a_hook_mint_with_another_extension() {
 
 /// Withdrawals check the hook too: without the extra accounts, and after
 /// the hook authority points the hook elsewhere (funds stay put until it
-/// points back or clears the hook).
+/// points back).
 #[test]
 fn hook_mint_withdraw_needs_the_extras_and_the_registry_hook() {
     let Some((mut svm, payer)) = setup() else {
@@ -1162,4 +1165,83 @@ fn hook_mint_withdraw_needs_the_extras_and_the_registry_hook() {
     repoint(&mut svm, Some(compliance_program_id()));
     send(&mut svm, &[withdraw()], &[&payer, &depositor]);
     assert_eq!(balance(&svm, &depositor_ata), 400);
+}
+
+/// Clearing the hook would let transfers skip it, and with it the vault
+/// PDA's record. Deposits and withdrawals refuse a cleared hook as they
+/// refuse a repointed one, and work again once it points back.
+#[test]
+fn hook_mint_deposit_and_withdraw_reject_a_cleared_hook() {
+    let Some((mut svm, payer)) = setup() else {
+        return;
+    };
+    let (mint, vault_ata, depositor, depositor_ata) = hook_vault(&mut svm, &payer, true);
+    let d = depositor.pubkey();
+    let vault = derive_vault(&mint);
+    let deposit = |amount| with_extras(ix_deposit(&d, &payer.pubkey(), &mint, &depositor_ata, &vault_ata, amount), hook_extras(&mint, &d, &vault));
+    send(&mut svm, &[deposit(600)], &[&payer, &depositor]);
+
+    let repoint = |svm: &mut LiteSVM, program: Option<Address>| {
+        let ix = spl_token_2022::extension::transfer_hook::instruction::update(&spl_token_2022::ID, &mint, &payer.pubkey(), &[], program).unwrap();
+        svm.expire_blockhash();
+        send(svm, &[ix], &[&payer]);
+    };
+    repoint(&mut svm, None);
+    let withdraw = || with_extras(ix_withdraw(&d, &mint, &vault_ata, &depositor_ata, 400), hook_extras(&mint, &vault, &d));
+    for (label, ix) in [
+        ("deposit", deposit(400)),
+        ("deposit without extras", ix_deposit(&d, &payer.pubkey(), &mint, &depositor_ata, &vault_ata, 400)),
+        ("withdraw", withdraw()),
+        ("withdraw without extras", ix_withdraw(&d, &mint, &vault_ata, &depositor_ata, 400)),
+    ] {
+        let err = format!("{:?}", try_send(&mut svm, &[ix], &[&payer, &depositor]).expect_err(label));
+        assert!(err.contains(&format!("Custom({})", 0x3050)), "{label}: expected TRANSFER_HOOK_MISMATCH, got {err}");
+    }
+    assert_eq!(balance(&svm, &vault_ata), 600);
+
+    repoint(&mut svm, Some(compliance_program_id()));
+    send(&mut svm, &[withdraw()], &[&payer, &depositor]);
+    assert_eq!(balance(&svm, &depositor_ata), 800);
+}
+
+/// The vault forwards whatever extra accounts the caller passes, so the
+/// caller can't be trusted to pass the right ones. Token-2022 resolves the
+/// hook's accounts itself; substituting any of them must fail, not run the
+/// hook against a record the caller chose. Here the vault PDA is not
+/// verified, so the honest deposit is refused and every substitution tries
+/// to get it through.
+#[test]
+fn hook_mint_deposit_rejects_substituted_extra_accounts() {
+    let Some((mut svm, payer)) = setup() else {
+        return;
+    };
+    let (mint, vault_ata, depositor, depositor_ata) = hook_vault(&mut svm, &payer, false);
+    let d = depositor.pubkey();
+    let vault = derive_vault(&mint);
+    // Another mint with its own meta list, and another verified participant.
+    let other_mint = Keypair::new();
+    create_hook_mint(&mut svm, &payer, &other_mint, compliance_program_id());
+    send(&mut svm, &[ix_init_meta_list(&payer.pubkey(), &other_mint.pubkey())], &[&payer]);
+    let bystander = Keypair::new().pubkey();
+    verify(&mut svm, &payer, &bystander);
+
+    let honest = hook_extras(&mint, &d, &vault);
+    let swap = |i: usize, key: Address| {
+        let mut e = honest.clone();
+        e[i] = AccountMeta::new_readonly(key, false);
+        e
+    };
+    let cases = [
+        ("vault record -> bystander's", swap(2, derive_record(&bystander))),
+        ("vault record -> depositor's", swap(2, derive_record(&d))),
+        ("meta list -> another mint's", swap(0, derive_meta_list(&other_mint.pubkey()))),
+        ("hook program -> vault program", swap(3, vault_program_id())),
+        ("extras reversed", honest.iter().rev().cloned().collect()),
+    ];
+    for (label, extras) in cases {
+        svm.expire_blockhash();
+        let ix = with_extras(ix_deposit(&d, &payer.pubkey(), &mint, &depositor_ata, &vault_ata, 1_000), extras);
+        try_send(&mut svm, &[ix], &[&payer, &depositor]).expect_err(label);
+        assert_eq!(balance(&svm, &vault_ata), 0, "{label}");
+    }
 }

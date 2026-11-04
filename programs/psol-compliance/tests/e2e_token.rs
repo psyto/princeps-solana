@@ -14,7 +14,8 @@
 //!     leg is not.
 //!
 //! Prerequisite: `target/deploy/psol_compliance.so` must exist
-//! (`cargo build-sbf` first). Tests early-return if missing.
+//! (`cargo build-sbf` first). Tests fail if it is missing, or
+//! early-return with `PSOL_SKIP_E2E=1`.
 //!
 //! LiteSVM 0.9.1 bundles `spl_token_2022 v10.0.0` as a pre-loaded
 //! program at `TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`, so no
@@ -58,10 +59,13 @@ fn setup() -> Option<(LiteSVM, Keypair)> {
     let path = so_path();
     if !path.exists() {
         eprintln!(
-            "SKIP: {} not built. Run `cargo build-sbf --manifest-path \
+            "{} not built. Run `cargo build-sbf --manifest-path \
              programs/psol-compliance/Cargo.toml` first.",
             path.display()
         );
+        if std::env::var_os("PSOL_SKIP_E2E").is_none() {
+            panic!("SBF build missing: run ./scripts/build-sbf.sh (or set PSOL_SKIP_E2E=1 to skip)");
+        }
         return None;
     }
     let bytes = std::fs::read(&path).expect("read .so");

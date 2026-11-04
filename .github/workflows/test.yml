@@ -1,0 +1,44 @@
+# Builds every program to target/deploy/*.so, then runs the workspace
+# tests against those fresh builds. The LiteSVM end-to-end suites load the
+# .so files and fail when they are missing (PSOL_SKIP_E2E is not set here).
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.local/share/solana
+            ~/.cache/solana
+          key: test-tools-${{ runner.os }}-agave-4.1.2
+
+      - name: Install the Solana toolchain
+        run: |
+          if [ ! -x ~/.local/share/solana/install/active_release/bin/cargo-build-sbf ]; then
+            sh -c "$(curl -sSfL https://release.anza.xyz/v4.1.2/install)"
+          fi
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Build the programs
+        run: |
+          rm -rf target/deploy
+          ./scripts/build-sbf.sh
+
+      - name: Test
+        run: cargo test --workspace

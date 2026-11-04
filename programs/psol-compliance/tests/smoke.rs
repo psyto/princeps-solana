@@ -13,9 +13,8 @@
 //! Prerequisite: the BPF artifact at `target/deploy/psol_compliance.so`
 //! must exist. Build it with `cargo build-sbf --manifest-path
 //! programs/psol-compliance/Cargo.toml`. If the artifact is missing the
-//! tests skip with an informative message rather than failing — this
-//! keeps `cargo test --workspace` green on hosts without the Solana
-//! SBF toolchain.
+//! tests fail; set `PSOL_SKIP_E2E=1` to skip them instead on hosts
+//! without the Solana SBF toolchain.
 
 use {
     bytemuck::from_bytes,
@@ -52,16 +51,19 @@ fn so_path() -> PathBuf {
 }
 
 /// Set up a fresh `LiteSVM` instance with the compliance program loaded
-/// and a funded payer. Returns `None` if the BPF artifact is missing,
-/// signaling that the calling test should skip.
+/// and a funded payer. Panics if the BPF artifact is missing; returns
+/// `None` (the calling test skips) only with `PSOL_SKIP_E2E=1`.
 fn setup() -> Option<(LiteSVM, Keypair)> {
     let path = so_path();
     if !path.exists() {
         eprintln!(
-            "SKIP: {} not built. Run `cargo build-sbf --manifest-path \
+            "{} not built. Run `cargo build-sbf --manifest-path \
              programs/psol-compliance/Cargo.toml` first.",
             path.display()
         );
+        if std::env::var_os("PSOL_SKIP_E2E").is_none() {
+            panic!("SBF build missing: run ./scripts/build-sbf.sh (or set PSOL_SKIP_E2E=1 to skip)");
+        }
         return None;
     }
     let bytes = std::fs::read(&path).expect("read .so");
@@ -471,7 +473,7 @@ fn set_haircut_rejects_class_above_table() {
 }
 
 // Quiet a warning when the err namespace is imported but the
-// negative tests above skip on hosts without the SBF artifact.
+// negative tests above skip (PSOL_SKIP_E2E=1) without the SBF artifact.
 #[cfg(test)]
 #[allow(dead_code)]
 fn _unused_err_link() {

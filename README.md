@@ -26,9 +26,11 @@ extension is a transfer hook running the vault's own registry (so `psol-complian
 registry if it implements the hook), and repo and lending inherit that, since they move positions
 inside a vault. `psol-settlement` takes plain mints only. Any other extension is refused
 (`init_vault` `0x300F`, `create_swap` `0x2019`, both legs): a transfer fee would leave less in the
-vault or escrow than was credited. A hook running another program is refused too (`0x3050`), at
-`init_vault` and on every later deposit and withdrawal, since the hook authority can repoint it;
-if it does, the vault's tokens stay put until it points the hook back at the registry or clears it.
+vault or escrow than was credited. A hook running another program, or a cleared hook, is refused too
+(`0x3050`), at `init_vault` and on every later deposit and withdrawal, since the hook authority can
+repoint or clear it; if it does, the vault's tokens stay put until it points the hook back at the
+registry. A mint whose layout Token-2022 would not produce (duplicate or partial entries, nonzero
+padding) is refused (`0x300B`).
 
 A hook-mint vault needs two things from you:
 - **Register the vault PDA in the registry and verify it.** The hook checks the owners of both
@@ -38,8 +40,9 @@ A hook-mint vault needs two things from you:
 - **Append the hook's accounts to `deposit` and `withdraw`**, after the documented ones: the
   mint's `ExtraAccountMetaList` PDA (`[b"extra-account-metas", mint]` under the registry), the
   `AccountRecord` of the source and of the destination owner, and the registry program
-  (`psol_vault::TRANSFER_HOOK_EXTRAS`). The vault forwards them to Token-2022 read-only; without
-  them the transfer fails.
+  (`psol_vault::TRANSFER_HOOK_EXTRAS`). The vault forwards them to Token-2022 read-only without
+  checking them; Token-2022 finds the hook's accounts by address, so missing or substituted ones
+  make the transfer fail rather than run the hook on records the caller chose.
 
 Settlement does not take hook mints because its escrows are held by a new PDA per ticket, and
 each would need its own verified record.
@@ -181,8 +184,12 @@ the prime broker on Reth in rdk, and a sibling to
 
 ```bash
 ./scripts/build-sbf.sh       # every program to target/deploy/*.so (the e2e tests load these)
-cargo test --workspace       # 165 tests: unit + LiteSVM end-to-end for every part
+cargo test --workspace       # 167 tests: unit + LiteSVM end-to-end for every part
 ```
+
+The end-to-end tests load `target/deploy/*.so` and fail if it is missing (`PSOL_SKIP_E2E=1`
+skips them instead); rebuild after changing a program, or they test the old build. CI
+(`.github/workflows/test.yml`) rebuilds every program before running the tests.
 
 ### Fuzzing the vault
 

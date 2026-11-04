@@ -66,9 +66,13 @@ pub const PLAIN_MINT_LEN: usize = 82;
 const EXT_ACCOUNT_TYPE_OFFSET: usize = 165;
 const EXT_ACCOUNT_TYPE_MINT: u8 = 1;
 /// Token-2022 `ExtensionType::TransferHook`; its value is
-/// `authority: [u8; 32]` then `program_id: [u8; 32]` (zero = none).
+/// `authority: [u8; 32]` then `program_id: [u8; 32]` (zero = cleared).
 const EXT_TRANSFER_HOOK: u16 = 14;
 const EXT_TRANSFER_HOOK_LEN: usize = 64;
+/// `is_initialized` in the base mint layout.
+const MINT_IS_INITIALIZED_OFFSET: usize = 45;
+/// Token-2022 refuses to read an account of exactly this size as a mint.
+const MULTISIG_LEN: usize = 355;
 
 /// Token-2022 `TransferChecked` instruction discriminator.
 const TOKEN_IX_TRANSFER_CHECKED: u8 = 12;
@@ -181,7 +185,7 @@ pub mod err {
     // Transfer-hook mints.
     /// The mint's transfer hook is not the vault's compliance program (at
     /// `init_vault`, or on a later deposit or withdrawal after the hook
-    /// authority changed it).
+    /// authority changed or cleared it).
     pub const TRANSFER_HOOK_MISMATCH: ProgramError = ProgramError::Custom(0x3050);
 }
 
@@ -1239,9 +1243,9 @@ pub const TRANSFER_HOOK_EXTRAS: usize = 4;
 /// Whether transfers of this mint run a transfer hook, after checking the
 /// mint is one the vault supports: a plain mint (`false`), or one whose
 /// only extension is `TransferHook` and whose hook program is
-/// `compliance_program` (`true`; a hook extension with no program set is
-/// `false`). Read on every deposit and withdrawal, because the hook
-/// authority can change the hook program after `init_vault`.
+/// `compliance_program` (`true`; a hook with no program set is
+/// `TRANSFER_HOOK_MISMATCH`). Read on every deposit and withdrawal, because
+/// the hook authority can change or clear the hook program after `init_vault`.
 fn transfer_hook_enabled(
     mint_ai: &AccountInfo,
     compliance_program: &[u8; 32],
@@ -1250,27 +1254,49 @@ fn transfer_hook_enabled(
     transfer_hook_enabled_bytes(&data, compliance_program)
 }
 
-/// `transfer_hook_enabled` on the mint account's bytes.
+/// `transfer_hook_enabled` on the mint account's bytes. Fails closed on any
+/// layout Token-2022 would not itself produce: an uninitialized base, nonzero
+/// padding, a multisig-sized account, a partial or duplicate TLV entry. A
+/// cleared hook (program id zero) counts as a mismatch, so the hook can't be
+/// switched off to get around the vault PDA's record.
 fn transfer_hook_enabled_bytes(data: &[u8], compliance_program: &[u8; 32]) -> Result<bool, ProgramError> {
+    if data.len() < PLAIN_MINT_LEN || data[MINT_IS_INITIALIZED_OFFSET] != 1 {
+        return Err(err::MINT_LAYOUT_INVALID);
+    }
     if data.len() == PLAIN_MINT_LEN {
         return Ok(false);
     }
-    if data.len() <= EXT_ACCOUNT_TYPE_OFFSET || data[EXT_ACCOUNT_TYPE_OFFSET] != EXT_ACCOUNT_TYPE_MINT {
+    if data.len() <= EXT_ACCOUNT_TYPE_OFFSET
+        || data.len() == MULTISIG_LEN
+        || data[PLAIN_MINT_LEN..EXT_ACCOUNT_TYPE_OFFSET].iter().any(|b| *b != 0)
+        || data[EXT_ACCOUNT_TYPE_OFFSET] != EXT_ACCOUNT_TYPE_MINT
+    {
         return Err(err::MINT_LAYOUT_INVALID);
     }
     let mut hook: Option<[u8; 32]> = None;
     let mut off = EXT_ACCOUNT_TYPE_OFFSET + 1;
-    while off + 4 <= data.len() {
+    while off < data.len() {
+        if off + 4 > data.len() {
+            // Too short for a TLV header: must be unused (zero) space.
+            if data[off..].iter().any(|b| *b != 0) {
+                return Err(err::MINT_LAYOUT_INVALID);
+            }
+            break;
+        }
         let ty = u16::from_le_bytes([data[off], data[off + 1]]);
         let len = u16::from_le_bytes([data[off + 2], data[off + 3]]) as usize;
         if ty == 0 {
-            // Uninitialized: the rest of the account is unused space.
+            // Uninitialized: the rest of the account is unused space, so
+            // it must all be zero (this entry's length included).
+            if data[off..].iter().any(|b| *b != 0) {
+                return Err(err::MINT_LAYOUT_INVALID);
+            }
             break;
         }
         if ty != EXT_TRANSFER_HOOK {
             return Err(err::MINT_HAS_EXTENSIONS);
         }
-        if len != EXT_TRANSFER_HOOK_LEN || off + 4 + len > data.len() {
+        if hook.is_some() || len != EXT_TRANSFER_HOOK_LEN || off + 4 + len > data.len() {
             return Err(err::MINT_LAYOUT_INVALID);
         }
         let mut program = [0u8; 32];
@@ -1280,7 +1306,6 @@ fn transfer_hook_enabled_bytes(data: &[u8], compliance_program: &[u8; 32]) -> Re
     }
     match hook {
         None => Ok(false),
-        Some(p) if p == [0u8; 32] => Ok(false),
         Some(p) if &p == compliance_program => Ok(true),
         Some(_) => Err(err::TRANSFER_HOOK_MISMATCH),
     }
@@ -1366,6 +1391,7 @@ mod tests {
     /// account type, then the given TLV entries.
     fn mint_with(entries: &[(u16, &[u8])], trailing: usize) -> alloc::vec::Vec<u8> {
         let mut d = alloc::vec![0u8; EXT_ACCOUNT_TYPE_OFFSET];
+        d[MINT_IS_INITIALIZED_OFFSET] = 1;
         d.push(EXT_ACCOUNT_TYPE_MINT);
         for (ty, value) in entries {
             d.extend_from_slice(&ty.to_le_bytes());
@@ -1387,11 +1413,18 @@ mod tests {
     fn mint_parser_accepts_plain_and_own_hook_only() {
         let reg = [7u8; 32];
         let ok = |d: &[u8]| transfer_hook_enabled_bytes(d, &reg);
-        assert_eq!(ok(&[0u8; PLAIN_MINT_LEN]), Ok(false));
+        let mut plain = [0u8; PLAIN_MINT_LEN];
+        plain[MINT_IS_INITIALIZED_OFFSET] = 1;
+        assert_eq!(ok(&plain), Ok(false));
         assert_eq!(ok(&mint_with(&[(EXT_TRANSFER_HOOK, &hook_value(reg))], 0)), Ok(true));
-        // trailing unused space and a cleared hook program
+        // trailing unused space (shorter and longer than a TLV header)
+        assert_eq!(ok(&mint_with(&[(EXT_TRANSFER_HOOK, &hook_value(reg))], 3)), Ok(true));
         assert_eq!(ok(&mint_with(&[(EXT_TRANSFER_HOOK, &hook_value(reg))], 7)), Ok(true));
-        assert_eq!(ok(&mint_with(&[(EXT_TRANSFER_HOOK, &hook_value([0; 32]))], 0)), Ok(false));
+        // a cleared hook program is a mismatch, not a plain mint
+        assert_eq!(
+            ok(&mint_with(&[(EXT_TRANSFER_HOOK, &hook_value([0; 32]))], 0)),
+            Err(err::TRANSFER_HOOK_MISMATCH)
+        );
         assert_eq!(
             ok(&mint_with(&[(EXT_TRANSFER_HOOK, &hook_value([8; 32]))], 0)),
             Err(err::TRANSFER_HOOK_MISMATCH)
@@ -1406,8 +1439,22 @@ mod tests {
     fn mint_parser_rejects_malformed_layouts() {
         let reg = [7u8; 32];
         let ok = |d: &[u8]| transfer_hook_enabled_bytes(d, &reg);
-        assert_eq!(ok(&[0u8; 100]), Err(err::MINT_LAYOUT_INVALID));
-        assert_eq!(ok(&[0u8; EXT_ACCOUNT_TYPE_OFFSET]), Err(err::MINT_LAYOUT_INVALID));
+        // an uninitialized plain mint
+        assert_eq!(ok(&[0u8; PLAIN_MINT_LEN]), Err(err::MINT_LAYOUT_INVALID));
+        let mut hundred = [0u8; 100];
+        hundred[MINT_IS_INITIALIZED_OFFSET] = 1;
+        assert_eq!(ok(&hundred), Err(err::MINT_LAYOUT_INVALID));
+        // an Uninitialized (type 0) entry followed by data: a nonzero length,
+        // or a byte further on
+        for at in [2, 10] {
+            let mut tail = mint_with(&[(EXT_TRANSFER_HOOK, &hook_value(reg))], 12);
+            let n = tail.len();
+            tail[n - 12 + at] = 1;
+            assert_eq!(ok(&tail), Err(err::MINT_LAYOUT_INVALID), "byte {at} after the terminator");
+        }
+        let mut short = [0u8; EXT_ACCOUNT_TYPE_OFFSET];
+        short[MINT_IS_INITIALIZED_OFFSET] = 1;
+        assert_eq!(ok(&short), Err(err::MINT_LAYOUT_INVALID));
         let mut wrong_type = mint_with(&[(EXT_TRANSFER_HOOK, &hook_value(reg))], 0);
         wrong_type[EXT_ACCOUNT_TYPE_OFFSET] = 2; // a token account, not a mint
         assert_eq!(ok(&wrong_type), Err(err::MINT_LAYOUT_INVALID));
@@ -1416,6 +1463,28 @@ mod tests {
         let mut cut = mint_with(&[(EXT_TRANSFER_HOOK, &hook_value(reg))], 0);
         cut.truncate(cut.len() - 1);
         assert_eq!(ok(&cut), Err(err::MINT_LAYOUT_INVALID));
+        // base mint not initialized
+        let mut uninit = mint_with(&[(EXT_TRANSFER_HOOK, &hook_value(reg))], 0);
+        uninit[MINT_IS_INITIALIZED_OFFSET] = 0;
+        assert_eq!(ok(&uninit), Err(err::MINT_LAYOUT_INVALID));
+        // nonzero padding between the base mint and the account type
+        let mut padded = mint_with(&[(EXT_TRANSFER_HOOK, &hook_value(reg))], 0);
+        padded[PLAIN_MINT_LEN] = 1;
+        assert_eq!(ok(&padded), Err(err::MINT_LAYOUT_INVALID));
+        // multisig-sized account
+        let mut multisig = mint_with(&[(EXT_TRANSFER_HOOK, &hook_value(reg))], 0);
+        multisig.resize(MULTISIG_LEN, 0);
+        assert_eq!(ok(&multisig), Err(err::MINT_LAYOUT_INVALID));
+        // two hook entries: a foreign one first, the registry second, and the reverse
+        let two = |a, b| mint_with(&[(EXT_TRANSFER_HOOK, &hook_value(a)), (EXT_TRANSFER_HOOK, &hook_value(b))], 0);
+        assert_eq!(ok(&two([8; 32], reg)), Err(err::MINT_LAYOUT_INVALID));
+        assert_eq!(ok(&two(reg, [8; 32])), Err(err::MINT_LAYOUT_INVALID));
+        // 1-3 dangling bytes holding a partial nonzero TLV type
+        for n in 1..=3 {
+            let mut dangling = mint_with(&[(EXT_TRANSFER_HOOK, &hook_value(reg))], n);
+            *dangling.last_mut().unwrap() = 3;
+            assert_eq!(ok(&dangling), Err(err::MINT_LAYOUT_INVALID), "{n} dangling bytes");
+        }
     }
 
     #[test]

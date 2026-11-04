@@ -60,12 +60,12 @@ jobs:
           # ~19 minutes at this harness's speed on ubuntu-latest
           # (asymmetric-research/crucible#25), so stop it from outside.
           set +e
-          timeout -s INT 180 crucible run psol_vault_fuzz invariant_vault \
+          timeout -s INT -k 30 180 crucible run psol_vault_fuzz invariant_vault \
             --binary-in target/release/invariant_test --timeout 180 > fuzz.log 2>&1
           rc=$?
           set -e
           tail -5 fuzz.log
-          if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$rc" -ne 130 ]; then
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$rc" -ne 130 ] && [ "$rc" -ne 137 ]; then
             echo "crucible exited $rc"; exit 1
           fi
           # crucible exits 0 even when it reports a finding.

@@ -12,10 +12,10 @@ path = "src/lib.rs"
 
 [dev-dependencies]
 psol-types                   = { workspace = true }
-psol-compliance              = { path = "../programs/psol-compliance" }
-psol-vault                   = { path = "../programs/psol-vault" }
-psol-settlement              = { path = "../programs/psol-settlement" }
-psol-lending                 = { path = "../programs/psol-lending" }
+psol-compliance              = { path = "../programs/psol-compliance", features = ["no-entrypoint"] }
+psol-vault                   = { path = "../programs/psol-vault", features = ["no-entrypoint"] }
+psol-settlement              = { path = "../programs/psol-settlement", features = ["no-entrypoint"] }
+psol-lending                 = { path = "../programs/psol-lending", features = ["no-entrypoint"] }
 bytemuck                     = { workspace = true }
 pinocchio-pubkey             = { workspace = true }
 litesvm                      = "0.9.1"
@@ -27,4 +27,4 @@ solana-program-pack          = "3"
 solana-signer                = "3"
 solana-system-interface      = "3"
 solana-transaction           = "3"
-spl-token-2022               = "10"
+spl-token-2022               = { version = "10", features = ["no-entrypoint"] }

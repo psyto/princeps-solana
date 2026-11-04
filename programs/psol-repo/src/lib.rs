@@ -36,8 +36,11 @@ use psol_types::{CheckError, Repo, repo_status, seeds};
 const PSOL_VAULT_IX_LOCK_POSITION: u8 = 3;
 const PSOL_VAULT_IX_UNLOCK_POSITION: u8 = 4;
 
+#[cfg(not(feature = "no-entrypoint"))]
 pinocchio::program_entrypoint!(process_instruction);
+#[cfg(any(not(feature = "no-entrypoint"), not(target_os = "solana")))]
 pinocchio::default_allocator!();
+#[cfg(any(not(feature = "no-entrypoint"), not(target_os = "solana")))]
 pinocchio::nostd_panic_handler!();
 
 // ─── Instruction discriminators ─────────────────────────────────────────-

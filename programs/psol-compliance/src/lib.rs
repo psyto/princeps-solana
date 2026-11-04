@@ -38,8 +38,11 @@ use psol_types::{
 // `#[panic_handler]` and so the BPF link fails with "panic_handler
 // function required, but not found". `nostd_panic_handler!` does
 // register one.
+#[cfg(not(feature = "no-entrypoint"))]
 pinocchio::program_entrypoint!(process_instruction);
+#[cfg(any(not(feature = "no-entrypoint"), not(target_os = "solana")))]
 pinocchio::default_allocator!();
+#[cfg(any(not(feature = "no-entrypoint"), not(target_os = "solana")))]
 pinocchio::nostd_panic_handler!();
 
 // ─── ExtraAccountMetaList byte builder ───────────────────────────────────

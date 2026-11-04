@@ -30,8 +30,11 @@ use pinocchio::{
 use pinocchio_system::instructions::CreateAccount;
 use psol_types::{CheckError, read_account_record};
 
+#[cfg(not(feature = "no-entrypoint"))]
 pinocchio::program_entrypoint!(process_instruction);
+#[cfg(any(not(feature = "no-entrypoint"), not(target_os = "solana")))]
 pinocchio::default_allocator!();
+#[cfg(any(not(feature = "no-entrypoint"), not(target_os = "solana")))]
 pinocchio::nostd_panic_handler!();
 
 // ─── Constants ─────────────────────────────────────────────────────────────

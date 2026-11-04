@@ -24,8 +24,8 @@ solana-message               = "3"
 solana-system-interface      = "3"
 solana-rent                  = "2"
 solana-program-pack          = "3"
-spl-token-2022               = "10"
-psol-compliance               = { path = "../psol-compliance" }
+spl-token-2022               = { version = "10", features = ["no-entrypoint"] }
+psol-compliance               = { path = "../psol-compliance", features = ["no-entrypoint"] }
 # Note: psol-vault is NOT a dev-dep either — see the comment under
 # `[dependencies]`. The test duplicates the two ix tags it needs and
 # pins them with the `vault_ix_discriminator_drift_check` test.

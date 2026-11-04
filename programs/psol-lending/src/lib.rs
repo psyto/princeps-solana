@@ -62,8 +62,11 @@ const PSOL_VAULT_IX_SEIZE_LOCKED: u8 = 6;
 pub const SLOTS_PER_YEAR: u128 = 78_840_000;
 pub const BPS_DENOMINATOR: u128 = 10_000;
 
+#[cfg(not(feature = "no-entrypoint"))]
 pinocchio::program_entrypoint!(process_instruction);
+#[cfg(any(not(feature = "no-entrypoint"), not(target_os = "solana")))]
 pinocchio::default_allocator!();
+#[cfg(any(not(feature = "no-entrypoint"), not(target_os = "solana")))]
 pinocchio::nostd_panic_handler!();
 
 // ─── Instruction discriminators ─────────────────────────────────────────-

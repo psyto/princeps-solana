@@ -38,17 +38,17 @@ use pinocchio::{
 use pinocchio_system::instructions::CreateAccount;
 use psol_types::{CheckError, Position, Vault, seeds};
 
-// Gate the entrypoint + allocator + panic handler behind a feature so
-// other on-chain programs that pull `psol-vault` in as a library (for
-// the `ix::*` discriminator constants, the `err::*` codes, etc.) don't
-// double-declare these symbols at link time. Cargo's `no-entrypoint`
-// feature is on by default for direct BPF builds; downstream lib
-// consumers (e.g. `psol-repo`) disable it.
+// `no-entrypoint` drops the entrypoint symbol (and, on SBF, the allocator
+// and panic handler) so a crate that links `psol-vault` as a library
+// doesn't double-declare them: another on-chain program, or a host test
+// binary that links several programs (Linux's linker rejects duplicate
+// `entrypoint` symbols). Host builds keep the allocator and panic handler,
+// which the `no_std` cdylib needs.
 #[cfg(not(feature = "no-entrypoint"))]
 pinocchio::program_entrypoint!(process_instruction);
-#[cfg(not(feature = "no-entrypoint"))]
+#[cfg(any(not(feature = "no-entrypoint"), not(target_os = "solana")))]
 pinocchio::default_allocator!();
-#[cfg(not(feature = "no-entrypoint"))]
+#[cfg(any(not(feature = "no-entrypoint"), not(target_os = "solana")))]
 pinocchio::nostd_panic_handler!();
 
 // ─── Constants ───────────────────────────────────────────────────────────

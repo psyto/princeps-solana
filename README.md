@@ -12,7 +12,7 @@ the contract. Take the one you need; the prime-broker flow they add up to is at 
 | refuse Token-2022 transfers unless both wallets are KYC-verified | `psol-compliance` (as a transfer hook) | — |
 | keep a per-wallet registry of KYC status, jurisdiction and accreditation | `psol-compliance` | — |
 | swap an asset for cash atomically, only if both parties pass KYC | `psol-settlement` | a registry¹ |
-| hold one asset for many depositors, KYC-gating deposits and withdrawals | `psol-vault` | a registry¹ |
+| hold one asset for many depositors, KYC-gating deposits and withdrawals (plain mints, or a hook running the registry) | `psol-vault` | a registry¹ |
 | lock two parties' vault positions for a repo | `psol-repo` | `psol-vault` (and its registry) |
 | open a term loan against haircut, oracle-priced collateral | `psol-lending` | `psol-vault`, `psol-compliance` (risk params and price feeds) |
 | read or write these accounts from your own program or client | `psol-types` (Rust crate) | `bytemuck` |
@@ -118,10 +118,13 @@ or generated client.
   record.check_transfer_allowed()?;            // Unverified / Suspended / Blocked
   ```
 - **CPI from your own program.** Build the instruction bytes from the handler docs, as
-  `psol-repo` and `psol-lending` do into `psol-vault` (`cpi_lock_position` and friends). Do not
-  link a psol program crate into another on-chain program as a Rust dependency: two Pinocchio
-  programs in one SBF binary clash on the allocator and panic handler. Copy the discriminator
-  bytes instead.
+  `psol-repo` and `psol-lending` do into `psol-vault` (`cpi_lock_position` and friends). Linking a
+  psol program crate into another on-chain program is untested; copy the discriminator bytes
+  instead.
+- **Link a program crate into a host binary** (tests, a client) for its `ix::*` and `err::*`
+  constants with `features = ["no-entrypoint"]`, as the e2e tests and quickstarts do. Without
+  it each crate exports an `entrypoint` symbol, and a binary linking two of them (or
+  `spl-token-2022`, which takes the same feature) fails to link on Linux.
 - **Bring your own registry.** Pass your program as the compliance program at `init_vault` or
   `create_swap`. The parts accept any account your program owns that decodes as an
   `AccountRecord` whose `participant` is the wallet in question; `psol-lending` also reads

@@ -63,6 +63,9 @@ pub mod err {
     pub const INSTRUCTION_DATA_TOO_SHORT: ProgramError = ProgramError::Custom(0x4004);
     pub const VAULT_PROGRAM_MISMATCH: ProgramError = ProgramError::Custom(0x4005);
     pub const COMPLIANCE_PROGRAM_MISMATCH: ProgramError = ProgramError::Custom(0x4006);
+    /// A position passed to `close_repo` is not the one the repo locked
+    /// (the borrower's collateral, the lender's cash).
+    pub const POSITION_NOT_PARTYS: ProgramError = ProgramError::Custom(0x4009);
     pub const BORROWER_RECORD_MISMATCH: ProgramError = ProgramError::Custom(0x4007);
     pub const LENDER_RECORD_MISMATCH: ProgramError = ProgramError::Custom(0x4008);
 
@@ -346,6 +349,10 @@ fn close_repo(program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> Pr
     };
     require_recorded_vault(collateral_vault_ai, &collateral_vault_key, vault_program_ai)?;
     require_recorded_vault(cash_vault_ai, &cash_vault_key, vault_program_ai)?;
+    // Unlock exactly the two positions this repo locked; unlocking any
+    // other position locked to the Repo PDA would strand the real ones.
+    require_position_of(collateral_position_ai, &collateral_vault_key, &borrower_key, vault_program_ai)?;
+    require_position_of(cash_position_ai, &cash_vault_key, &lender_key, vault_program_ai)?;
 
     // CPI vault::unlock_position twice, signing as the Repo PDA.
     let nonce_bytes = nonce.to_le_bytes();
@@ -508,6 +515,26 @@ fn require_recorded_vault(
         return Err(err::VAULT_PROGRAM_MISMATCH);
     }
     require_owned_by(vault_ai, vault_program_ai.key())
+}
+
+/// `position_ai` is a vault position in `vault` belonging to `owner`.
+fn require_position_of(
+    position_ai: &AccountInfo,
+    vault: &[u8; 32],
+    owner: &[u8; 32],
+    vault_program_ai: &AccountInfo,
+) -> ProgramResult {
+    require_owned_by(position_ai, vault_program_ai.key())?;
+    let data = position_ai.try_borrow_data()?;
+    if data.len() < psol_types::Position::LEN {
+        return Err(err::POSITION_NOT_PARTYS);
+    }
+    let p: &psol_types::Position = bytemuck::try_from_bytes(&data[..psol_types::Position::LEN])
+        .map_err(|_| err::POSITION_NOT_PARTYS)?;
+    if &p.vault != vault || &p.depositor != owner {
+        return Err(err::POSITION_NOT_PARTYS);
+    }
+    Ok(())
 }
 
 fn require_owned_by(ai: &AccountInfo, program: &Pubkey) -> ProgramResult {

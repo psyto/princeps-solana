@@ -607,6 +607,11 @@ fn repay_loan(program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> Pr
     // The repayment must land in the lender's own position in the cash
     // vault; the vault only checks that the destination is *a* position.
     require_position_of(lender_cash_position_ai, &cash_vault_key, &lender_key, vault_program_ai)?;
+    // And it must come from, and unlock, the borrower's own positions:
+    // unlocking any other position locked to this loan would leave the
+    // real collateral locked to a REPAID loan.
+    require_position_of(borrower_cash_position_ai, &cash_vault_key, &borrower_key, vault_program_ai)?;
+    require_position_of(collateral_position_ai, &collateral_vault_key, &borrower_key, vault_program_ai)?;
 
     // CPI vault::transfer_within_vault from borrower's cash position
     // to lender's cash position (borrower signs).

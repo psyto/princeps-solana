@@ -1755,3 +1755,29 @@ fn liquidate_loan_rejects_a_destination_that_is_not_the_lenders_position() {
     let err = format!("{:?}", res.expect_err("liquidating into someone else's position must reject"));
     assert!(err.contains(&format!("Custom({})", 0x5009)), "expected POSITION_NOT_PARTYS, got {err}");
 }
+
+/// Repay must unlock the borrower's own collateral position; passing any
+/// other position (here the lender's, in the same collateral vault) is
+/// refused before any CPI.
+#[test]
+fn repay_loan_rejects_a_collateral_position_that_is_not_the_borrowers() {
+    let Some((mut svm, payer)) = setup() else {
+        return;
+    };
+    let f = setup_fixture(&mut svm, payer);
+    let nonce = 1u64;
+    send(
+        &mut svm,
+        &[ix_open_loan(
+            &f.borrower.pubkey(), &f.lender.pubkey(), &f.payer.pubkey(),
+            &f.collateral_mint, &f.cash_mint, 300_000, 200_000, u64::MAX, nonce, 0,
+            &[], &[], &[f.collateral_mint, f.cash_mint], &[],
+        )],
+        &[&f.payer, &f.borrower, &f.lender],
+    );
+    let mut ix = ix_repay_loan(&f.borrower.pubkey(), &f.lender.pubkey(), &f.collateral_mint, &f.cash_mint, nonce);
+    ix.accounts[3].pubkey = derive_position(&derive_vault(&f.collateral_mint), &f.lender.pubkey());
+    let res = try_send(&mut svm, &[ix], &[&f.payer, &f.borrower]);
+    let err = format!("{:?}", res.expect_err("repay with another collateral position must reject"));
+    assert!(err.contains(&format!("Custom({})", 0x5009)), "expected POSITION_NOT_PARTYS, got {err}");
+}

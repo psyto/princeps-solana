@@ -130,9 +130,10 @@ the caller passes:
 
 Vault and settlement also check every token account they move tokens through: the vault's own
 account must be held by the vault PDA for that mint (`0x300E`), and DvP escrows must be held by
-the ticket and each destination by the party it pays (`0x2018`). `psol-lending`'s repay must pay
-into the lender's own position, and liquidation must seize from the borrower's position into the
-lender's (`0x5009`).
+the ticket and each destination by the party it pays (`0x2018`). `psol-lending`'s repay and
+liquidation, and `psol-repo`'s close, act only on the positions the agreement locked and the
+parties it names: repay pays into the lender's own position, liquidation seizes from the
+borrower's position into the lender's (`0x5009`, `0x4009` for repo).
 
 A repo has no default path yet. Before its expiry only the borrower can close it; after expiry
 either party can, which unlocks both positions.
@@ -158,7 +159,7 @@ the prime broker on Reth in rdk, and a sibling to
 
 ```bash
 ./scripts/build-sbf.sh       # every program to target/deploy/*.so (the e2e tests load these)
-cargo test --workspace       # 152 tests: unit + LiteSVM end-to-end for every part
+cargo test --workspace       # 154 tests: unit + LiteSVM end-to-end for every part
 ```
 
 ## License

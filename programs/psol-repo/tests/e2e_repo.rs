@@ -711,3 +711,27 @@ fn lender_can_close_a_repo_only_after_expiry() {
     let cp: Position = *from_bytes(&svm.get_account(&cp).unwrap().data[..Position::LEN]);
     assert_eq!(cp.locked_amount, 0, "borrower's collateral unlocked");
 }
+
+/// Close must unlock exactly the positions the repo locked; passing the
+/// lender's cash position in the collateral slot is refused before any CPI.
+#[test]
+fn close_repo_rejects_positions_the_repo_did_not_lock() {
+    let Some((mut svm, payer)) = setup() else {
+        return;
+    };
+    let f = setup_fixture(&mut svm, payer);
+    let nonce = 1u64;
+    send(
+        &mut svm,
+        &[ix_open_repo(
+            &f.borrower.pubkey(), &f.lender.pubkey(), &f.payer.pubkey(),
+            &f.collateral_mint, &f.cash_mint, 300_000, 200_000, u64::MAX, nonce,
+        )],
+        &[&f.payer, &f.borrower, &f.lender],
+    );
+    let mut ix = ix_close_repo(&f.borrower.pubkey(), &f.lender.pubkey(), &f.collateral_mint, &f.cash_mint, nonce);
+    ix.accounts[3].pubkey = derive_position(&derive_vault(&f.cash_mint), &f.lender.pubkey());
+    let res = try_send(&mut svm, &[ix], &[&f.payer, &f.borrower]);
+    let err = format!("{:?}", res.expect_err("close with a position the repo did not lock must reject"));
+    assert!(err.contains(&format!("Custom({})", 0x4009)), "expected POSITION_NOT_PARTYS, got {err}");
+}

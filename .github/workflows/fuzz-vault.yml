@@ -1,7 +1,8 @@
 # Fuzzes psol-vault's deposit and withdraw with solinv on every pull
 # request that touches the vault, the compliance program or the harness:
 # signer-skip, owner-skip, and account-swap (B's record, B's position, a
-# token account the vault does not hold, another compliance program).
+# token account the vault does not hold, another compliance program, and
+# that program swapped in together with a record it owns).
 # Fails on any finding. See fuzz/psol-vault/README.md.
 name: fuzz psol-vault
 

@@ -166,6 +166,20 @@ the prime broker on Reth in rdk, and a sibling to
 cargo test --workspace       # 156 tests: unit + LiteSVM end-to-end for every part
 ```
 
+### Fuzzing the vault
+
+[`fuzz/psol-vault`](fuzz/psol-vault) fuzzes `deposit` and `withdraw` against the built programs with
+[solinv](https://github.com/psyto/solinv)'s signer-skip, owner-skip and account-swap checks. It
+swaps in another depositor's record or position, a token account the vault does not hold, or
+another compliance program. CI runs it for 3 minutes on every pull request that touches the vault,
+the compliance program or `psol-types` (`.github/workflows/fuzz-vault.yml`), and fails on any finding.
+
+Measured by deleting one check at a time: the vault-side account on deposit, the withdrawal
+destination, the position binding and the record's participant are each caught; the current code
+gives 0 findings. The registry pin on withdraw is not caught, because the attack needs two accounts
+swapped together. The e2e test `withdraw_rejects_records_from_another_compliance_program` covers it.
+Details: [`fuzz/psol-vault/README.md`](fuzz/psol-vault/README.md).
+
 ## License
 
 MIT OR Apache-2.0.

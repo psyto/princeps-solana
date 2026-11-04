@@ -92,7 +92,7 @@ pub mod err {
     /// a destination is not the right party's token account for the mint
     /// it receives.
     pub const TOKEN_ACCOUNT_MISMATCH: ProgramError = ProgramError::Custom(0x2018);
-    /// `fund`'s mint is not a plain Token-2022 mint (it has extensions).
+    /// A leg's mint is not a plain Token-2022 mint (it has extensions).
     pub const MINT_HAS_EXTENSIONS: ProgramError = ProgramError::Custom(0x2019);
 }
 
@@ -152,13 +152,16 @@ pub fn process_instruction(
 //   [3]                compliance program — `settle` accepts only records
 //                      owned by it; part of the ticket's PDA seeds, so the
 //                      parties' expected ticket address commits to it
+//   [4]                mint_a, [5] mint_b — both must be plain Token-2022
+//                      mints, checked here so a ticket can never hold one
+//                      funded leg and one leg that cannot be funded
 //
 // Data: party_a(32) party_b(32) mint_a(32) mint_b(32)
 //       amount_a(8) amount_b(8) decimals_a(1) decimals_b(1)
 //       expiry_slot(8) nonce(8)   = 162 bytes
 fn create_swap(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    let [payer_ai, ticket_ai, _system_ai, compliance_program_ai] = match accounts {
-        [p, t, s, cp, ..] => [p, t, s, cp],
+    let [payer_ai, ticket_ai, _system_ai, compliance_program_ai, mint_a_ai, mint_b_ai] = match accounts {
+        [p, t, s, cp, ma, mb, ..] => [p, t, s, cp, ma, mb],
         _ => return Err(ProgramError::NotEnoughAccountKeys),
     };
     require_signer(payer_ai)?;
@@ -179,6 +182,14 @@ fn create_swap(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     let decimals_b = data[145];
     let expiry_slot = u64::from_le_bytes(data[146..154].try_into().unwrap());
     let nonce = u64::from_le_bytes(data[154..162].try_into().unwrap());
+    if mint_a_ai.key() != &mint_a || mint_b_ai.key() != &mint_b {
+        return Err(err::MINT_MISMATCH);
+    }
+    for m in [mint_a_ai, mint_b_ai] {
+        if m.owner() != &TOKEN_2022_PROGRAM_ID || m.data_len() != PLAIN_MINT_LEN {
+            return Err(err::MINT_HAS_EXTENSIONS);
+        }
+    }
 
     let nonce_le = nonce.to_le_bytes();
     let (expected, bump) = find_program_address(

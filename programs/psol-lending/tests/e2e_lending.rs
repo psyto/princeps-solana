@@ -1722,3 +1722,36 @@ fn repay_loan_rejects_a_destination_that_is_not_the_lenders_position() {
     let err = format!("{:?}", res.expect_err("repay into someone else's position must reject"));
     assert!(err.contains(&format!("Custom({})", 0x5009)), "expected POSITION_NOT_PARTYS, got {err}");
 }
+
+/// After maturity the lender liquidates into an accomplice's collateral
+/// position instead of their own. `liquidate_loan` must refuse.
+#[test]
+fn liquidate_loan_rejects_a_destination_that_is_not_the_lenders_position() {
+    let Some((mut svm, payer)) = setup() else {
+        return;
+    };
+    let f = setup_fixture(&mut svm, payer);
+    let nonce = 1u64;
+    send(
+        &mut svm,
+        &[ix_open_loan(
+            &f.borrower.pubkey(), &f.lender.pubkey(), &f.payer.pubkey(),
+            &f.collateral_mint, &f.cash_mint, 300_000, 200_000, 100, nonce, 0,
+            &[], &[], &[f.collateral_mint, f.cash_mint], &[],
+        )],
+        &[&f.payer, &f.borrower, &f.lender],
+    );
+    let accomplice = Keypair::new();
+    svm.airdrop(&accomplice.pubkey(), 1_000_000_000).unwrap();
+    send(
+        &mut svm,
+        &[ix_init_position(&accomplice.pubkey(), &f.payer.pubkey(), &f.collateral_mint)],
+        &[&f.payer, &accomplice],
+    );
+    svm.warp_to_slot(101);
+    let mut ix = ix_liquidate_loan(&f.borrower.pubkey(), &f.lender.pubkey(), &f.collateral_mint, &f.cash_mint, nonce);
+    ix.accounts[4].pubkey = derive_position(&derive_vault(&f.collateral_mint), &accomplice.pubkey());
+    let res = try_send(&mut svm, &[ix], &[&f.payer, &f.lender]);
+    let err = format!("{:?}", res.expect_err("liquidating into someone else's position must reject"));
+    assert!(err.contains(&format!("Custom({})", 0x5009)), "expected POSITION_NOT_PARTYS, got {err}");
+}

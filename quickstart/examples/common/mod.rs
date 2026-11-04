@@ -483,7 +483,8 @@ impl Swap {
         .0
     }
 
-    /// Accounts: [payer (s,w), ticket PDA (w), system, compliance program].
+    /// Accounts: [payer (s,w), ticket PDA (w), system, compliance program,
+    /// mint A, mint B].
     /// Data: a b mint_a mint_b amount_a amount_b decimals_a decimals_b
     /// expiry_slot nonce. Also creates the ticket's two escrow ATAs.
     pub fn create(&self, env: &mut Env, expiry_slot: u64) {
@@ -503,6 +504,8 @@ impl Swap {
                 AccountMeta::new(self.ticket(), false),
                 AccountMeta::new_readonly(SYSTEM, false),
                 AccountMeta::new_readonly(COMPLIANCE, false),
+                AccountMeta::new_readonly(self.mint_a, false),
+                AccountMeta::new_readonly(self.mint_b, false),
             ],
             data,
         };

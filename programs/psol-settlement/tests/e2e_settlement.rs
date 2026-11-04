@@ -271,6 +271,8 @@ fn ix_create_swap(
             AccountMeta::new(*ticket, false),
             AccountMeta::new_readonly(solana_system_interface::program::ID, false),
             AccountMeta::new_readonly(compliance_program_id(), false),
+            AccountMeta::new_readonly(*ma, false),
+            AccountMeta::new_readonly(*mb, false),
         ],
         data,
     }
@@ -604,4 +606,34 @@ fn settle_rejects_destinations_not_owned_by_the_parties() {
     ));
     assert_eq!(balance(&svm, &fx.escrow_a), fx.amount_a);
     assert_eq!(balance(&svm, &fx.escrow_b), fx.amount_b);
+}
+
+/// A ticket whose cash leg uses a mint with extensions is refused at
+/// creation, so no one can fund the other leg into a ticket that can never
+/// be fully funded.
+#[test]
+fn create_swap_rejects_a_mint_with_extensions() {
+    let Some((mut svm, payer)) = setup() else { return };
+    use spl_token_2022::extension::ExtensionType;
+    let plain = Keypair::new();
+    create_plain_mint(&mut svm, &payer, &plain, &payer.pubkey(), DECIMALS);
+    let ext = Keypair::new();
+    let space = ExtensionType::try_calculate_account_len::<spl_token_2022::state::Mint>(&[ExtensionType::MintCloseAuthority]).unwrap();
+    let lamports = svm.minimum_balance_for_rent_exemption(space);
+    let create = solana_system_interface::instruction::create_account(
+        &payer.pubkey(), &ext.pubkey(), lamports, space as u64, &spl_token_2022::ID,
+    );
+    let close = spl_token_2022::instruction::initialize_mint_close_authority(&spl_token_2022::ID, &ext.pubkey(), Some(&payer.pubkey())).unwrap();
+    let init = spl_token_2022::instruction::initialize_mint2(&spl_token_2022::ID, &ext.pubkey(), &payer.pubkey(), None, DECIMALS).unwrap();
+    send(&mut svm, &[create, close, init], &[&payer, &ext]);
+
+    let (a, b) = (Keypair::new().pubkey(), Keypair::new().pubkey());
+    let (ma, mb) = (plain.pubkey(), ext.pubkey());
+    let ticket = derive_ticket(&a, &b, &ma, &mb, 1);
+    assert!(!try_send(
+        &mut svm,
+        &[ix_create_swap(&payer.pubkey(), &ticket, &a, &b, &ma, &mb, 1, 1, DECIMALS, u64::MAX, 1)],
+        &[&payer],
+    ));
+    assert!(svm.get_account(&ticket).map_or(true, |acc| acc.data.is_empty()), "no ticket created");
 }

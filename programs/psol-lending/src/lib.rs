@@ -99,8 +99,8 @@ pub mod err {
     pub const INSTRUCTION_DATA_TOO_SHORT: ProgramError = ProgramError::Custom(0x5004);
     pub const VAULT_PROGRAM_MISMATCH: ProgramError = ProgramError::Custom(0x5005);
     pub const COMPLIANCE_PROGRAM_MISMATCH: ProgramError = ProgramError::Custom(0x5006);
-    /// `repay_loan`'s destination position is not the lender's position in
-    /// the loan's cash vault.
+    /// A position passed to `repay_loan` / `liquidate_loan` is not the
+    /// expected party's position in the loan's vault.
     pub const POSITION_NOT_PARTYS: ProgramError = ProgramError::Custom(0x5009);
     pub const BORROWER_RECORD_MISMATCH: ProgramError = ProgramError::Custom(0x5007);
     pub const LENDER_RECORD_MISMATCH: ProgramError = ProgramError::Custom(0x5008);
@@ -750,6 +750,11 @@ fn liquidate_loan(
     // Same binding as `repay_loan`: the collateral vault must be the
     // recorded one and owned by the program we CPI into.
     require_recorded_vault(collateral_vault_ai, &collateral_vault_key, vault_program_ai)?;
+    // Seize from the borrower's own position into the lender's own: any
+    // other source would leave the real collateral locked to a closed
+    // loan, any other destination would pay someone else.
+    require_position_of(borrower_collateral_ai, &collateral_vault_key, &borrower_key, vault_program_ai)?;
+    require_position_of(lender_collateral_ai, &collateral_vault_key, &lender_key, vault_program_ai)?;
 
     // CPI vault::seize_locked, Loan PDA signs as the lock authority.
     let nonce_bytes = nonce.to_le_bytes();

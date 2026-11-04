@@ -9,10 +9,13 @@ pull request that touches the vault (`.github/workflows/fuzz-vault.yml`).
 ./scripts/build-sbf.sh                       # from the repo root
 cd fuzz/psol-vault
 cargo build --release --features invariant_vault
-crucible run psol_vault_fuzz invariant_vault --binary-in target/release/invariant_test --timeout 60
+timeout -s INT 180 crucible run psol_vault_fuzz invariant_vault --binary-in target/release/invariant_test --timeout 180
 ```
 
-Any `[FUZZ_FINDING]` line is a failure (crucible itself exits 0).
+Any `[FUZZ_FINDING]` line is a failure (crucible itself exits 0). The outer
+`timeout` is there because crucible checks `--timeout` only every 1000
+iterations, about 4 minutes locally and 19 on `ubuntu-latest` for this
+harness ([crucible#25](https://github.com/asymmetric-research/crucible/issues/25)). On macOS, `timeout` is `gtimeout` from coreutils.
 
 ## What it catches
 

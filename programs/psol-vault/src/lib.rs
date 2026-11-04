@@ -61,6 +61,15 @@ pub const TOKEN_2022_PROGRAM_ID: Pubkey =
 /// Size of a Token-2022 mint with no extensions.
 pub const PLAIN_MINT_LEN: usize = 82;
 
+/// A mint with extensions: the base layout padded to 165 bytes, an account
+/// type byte (1 = mint), then TLV entries (`u16` type, `u16` length, value).
+const EXT_ACCOUNT_TYPE_OFFSET: usize = 165;
+const EXT_ACCOUNT_TYPE_MINT: u8 = 1;
+/// Token-2022 `ExtensionType::TransferHook`; its value is
+/// `authority: [u8; 32]` then `program_id: [u8; 32]` (zero = none).
+const EXT_TRANSFER_HOOK: u16 = 14;
+const EXT_TRANSFER_HOOK_LEN: usize = 64;
+
 /// Token-2022 `TransferChecked` instruction discriminator.
 const TOKEN_IX_TRANSFER_CHECKED: u8 = 12;
 /// Length of the Token-2022 `TransferChecked` data payload.
@@ -130,8 +139,8 @@ pub mod err {
     /// The vault-side token account is not a Token-2022 account for this
     /// mint owned by the vault PDA.
     pub const TOKEN_ACCOUNT_MISMATCH: ProgramError = ProgramError::Custom(0x300E);
-    /// `init_vault`'s mint carries Token-2022 extensions; only plain mints
-    /// are supported.
+    /// The mint carries a Token-2022 extension other than `TransferHook`;
+    /// only plain mints and transfer-hook mints are supported.
     pub const MINT_HAS_EXTENSIONS: ProgramError = ProgramError::Custom(0x300F);
 
     // Compliance failures (mirror `CheckError`, distinct from
@@ -168,6 +177,12 @@ pub mod err {
     /// `seize_locked` amount exceeds the source position's
     /// `locked_amount`.
     pub const SEIZE_EXCEEDS_LOCKED: ProgramError = ProgramError::Custom(0x3043);
+
+    // Transfer-hook mints.
+    /// The mint's transfer hook is not the vault's compliance program (at
+    /// `init_vault`, or on a later deposit or withdrawal after the hook
+    /// authority changed it).
+    pub const TRANSFER_HOOK_MISMATCH: ProgramError = ProgramError::Custom(0x3050);
 }
 
 // ─── Entrypoint dispatch ─────────────────────────────────────────────────
@@ -222,12 +237,11 @@ fn init_vault(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pro
     if mint_ai.owner() != &TOKEN_2022_PROGRAM_ID {
         return Err(err::TOKEN_PROGRAM_MISMATCH);
     }
-    // Plain mints only: an extension such as a transfer fee would deliver
-    // less than the amount credited to the position, and a transfer hook
-    // needs extra accounts this program does not forward.
-    if mint_ai.data_len() != PLAIN_MINT_LEN {
-        return Err(err::MINT_HAS_EXTENSIONS);
-    }
+    // Plain mints, or mints whose only extension is a transfer hook that
+    // runs this vault's compliance program. Any other extension (a transfer
+    // fee, say) could deliver less than the amount credited to a position,
+    // and a hook running some other program could block withdrawals.
+    transfer_hook_enabled(mint_ai, compliance_program_ai.key())?;
     let mint_key = *mint_ai.key();
     let (expected_vault, bump) = find_program_address(&[seeds::VAULT, &mint_key], program_id);
     if &expected_vault != vault_ai.key() {
@@ -293,6 +307,9 @@ fn init_vault(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pro
 ///   [8,  write]          vault's ATA       (dest of transfer)
 ///   [9,  read]           token_program (must equal Token-2022 ID)
 ///   [10, read]           system_program (for position-create rent CPI)
+///   [11..]               transfer-hook mints only: the hook's extra
+///                         accounts, forwarded to Token-2022 read-only
+///                         (see `TRANSFER_HOOK_EXTRAS`)
 ///
 /// Instruction data (after the dispatch tag):
 ///   [0..8]  amount: u64 LE
@@ -353,6 +370,11 @@ fn deposit(
 
     // CPI Token-2022 transfer_checked from depositor_ata to vault_ata,
     // signed by the depositor (authority on the source).
+    let extras = if transfer_hook_enabled(mint_ai, &vault_compliance)? {
+        &accounts[11..]
+    } else {
+        &[]
+    };
     let decimals = read_mint_decimals(mint_ai)?;
     cpi_transfer_checked(
         token_program_ai.key(),
@@ -363,6 +385,7 @@ fn deposit(
         amount,
         decimals,
         &[],
+        extras,
     )?;
 
     // Update vault + position bookkeeping.
@@ -425,6 +448,8 @@ fn deposit(
 ///   [6,  write]         vault's ATA (source)
 ///   [7,  write]         depositor's ATA (dest)
 ///   [8,  read]          token_program (Token-2022)
+///   [9..]               transfer-hook mints only: the hook's extra
+///                        accounts, as for `deposit`
 ///
 /// Instruction data (after the dispatch tag):
 ///   [0..8]  amount: u64 LE
@@ -495,6 +520,11 @@ fn withdraw(
         Seed::from(&bump_seed[..]),
     ];
     let vault_signer = Signer::from(&vault_seeds);
+    let extras = if transfer_hook_enabled(mint_ai, &vault_compliance)? {
+        &accounts[9..]
+    } else {
+        &[]
+    };
     let decimals = read_mint_decimals(mint_ai)?;
     cpi_transfer_checked(
         token_program_ai.key(),
@@ -505,6 +535,7 @@ fn withdraw(
         amount,
         decimals,
         &[vault_signer],
+        extras,
     )?;
 
     // Update bookkeeping.
@@ -1193,11 +1224,74 @@ fn read_mint_decimals(mint_ai: &AccountInfo) -> Result<u8, ProgramError> {
     Ok(data[44])
 }
 
+/// What a client appends to `deposit` / `withdraw` for a mint whose
+/// transfer hook is `psol-compliance` (any order; Token-2022 finds them by
+/// address):
+///
+///   * the `ExtraAccountMetaList` PDA, `[b"extra-account-metas", mint]`
+///     under the compliance program;
+///   * the `AccountRecord` of the source token account's owner and of the
+///     destination's owner. One of the two is always the vault PDA, so the
+///     registry must hold a `VERIFIED` record for the vault PDA itself;
+///   * the compliance program.
+pub const TRANSFER_HOOK_EXTRAS: usize = 4;
+
+/// Whether transfers of this mint run a transfer hook, after checking the
+/// mint is one the vault supports: a plain mint (`false`), or one whose
+/// only extension is `TransferHook` and whose hook program is
+/// `compliance_program` (`true`; a hook extension with no program set is
+/// `false`). Read on every deposit and withdrawal, because the hook
+/// authority can change the hook program after `init_vault`.
+fn transfer_hook_enabled(
+    mint_ai: &AccountInfo,
+    compliance_program: &[u8; 32],
+) -> Result<bool, ProgramError> {
+    let data = mint_ai.try_borrow_data()?;
+    transfer_hook_enabled_bytes(&data, compliance_program)
+}
+
+/// `transfer_hook_enabled` on the mint account's bytes.
+fn transfer_hook_enabled_bytes(data: &[u8], compliance_program: &[u8; 32]) -> Result<bool, ProgramError> {
+    if data.len() == PLAIN_MINT_LEN {
+        return Ok(false);
+    }
+    if data.len() <= EXT_ACCOUNT_TYPE_OFFSET || data[EXT_ACCOUNT_TYPE_OFFSET] != EXT_ACCOUNT_TYPE_MINT {
+        return Err(err::MINT_LAYOUT_INVALID);
+    }
+    let mut hook: Option<[u8; 32]> = None;
+    let mut off = EXT_ACCOUNT_TYPE_OFFSET + 1;
+    while off + 4 <= data.len() {
+        let ty = u16::from_le_bytes([data[off], data[off + 1]]);
+        let len = u16::from_le_bytes([data[off + 2], data[off + 3]]) as usize;
+        if ty == 0 {
+            // Uninitialized: the rest of the account is unused space.
+            break;
+        }
+        if ty != EXT_TRANSFER_HOOK {
+            return Err(err::MINT_HAS_EXTENSIONS);
+        }
+        if len != EXT_TRANSFER_HOOK_LEN || off + 4 + len > data.len() {
+            return Err(err::MINT_LAYOUT_INVALID);
+        }
+        let mut program = [0u8; 32];
+        program.copy_from_slice(&data[off + 4 + 32..off + 4 + 64]);
+        hook = Some(program);
+        off += 4 + len;
+    }
+    match hook {
+        None => Ok(false),
+        Some(p) if p == [0u8; 32] => Ok(false),
+        Some(p) if &p == compliance_program => Ok(true),
+        Some(_) => Err(err::TRANSFER_HOOK_MISMATCH),
+    }
+}
+
 /// Construct + invoke a Token-2022 `TransferChecked` CPI.
 ///
 /// `signers` is empty for depositor-authorized transfers; for the
 /// vault-authorized withdraw path the caller passes the vault PDA's
-/// signer seeds.
+/// signer seeds. `extras` (a transfer hook's extra accounts) are appended
+/// read-only and never as signers.
 #[allow(clippy::too_many_arguments)]
 fn cpi_transfer_checked(
     token_program_id: &Pubkey,
@@ -1208,24 +1302,31 @@ fn cpi_transfer_checked(
     amount: u64,
     decimals: u8,
     signers: &[Signer<'_, '_>],
+    extras: &[AccountInfo],
 ) -> ProgramResult {
     let mut data = [0u8; TRANSFER_CHECKED_DATA_LEN];
     data[0] = TOKEN_IX_TRANSFER_CHECKED;
     data[1..9].copy_from_slice(&amount.to_le_bytes());
     data[9] = decimals;
 
-    let metas = [
+    let mut metas = alloc::vec::Vec::with_capacity(4 + extras.len());
+    metas.extend_from_slice(&[
         AccountMeta::new(source.key(), true, false),
         AccountMeta::new(mint.key(), false, false),
         AccountMeta::new(destination.key(), true, false),
         AccountMeta::new(authority.key(), false, true),
-    ];
+    ]);
+    let mut infos = alloc::vec::Vec::with_capacity(4 + extras.len());
+    infos.extend_from_slice(&[source, mint, destination, authority]);
+    for extra in extras {
+        metas.push(AccountMeta::readonly(extra.key()));
+        infos.push(extra);
+    }
     let ix = Instruction {
         program_id: token_program_id,
         data: &data,
         accounts: &metas,
     };
-    let infos = [source, mint, destination, authority];
     pinocchio::cpi::slice_invoke_signed(&ix, &infos, signers)
 }
 
@@ -1259,6 +1360,62 @@ mod tests {
                 panic!("expected Custom variant");
             }
         }
+    }
+
+    /// A mint with extensions: 82 base bytes, zero padding to 165, the
+    /// account type, then the given TLV entries.
+    fn mint_with(entries: &[(u16, &[u8])], trailing: usize) -> alloc::vec::Vec<u8> {
+        let mut d = alloc::vec![0u8; EXT_ACCOUNT_TYPE_OFFSET];
+        d.push(EXT_ACCOUNT_TYPE_MINT);
+        for (ty, value) in entries {
+            d.extend_from_slice(&ty.to_le_bytes());
+            d.extend_from_slice(&(value.len() as u16).to_le_bytes());
+            d.extend_from_slice(value);
+        }
+        d.extend(core::iter::repeat(0).take(trailing));
+        d
+    }
+
+    fn hook_value(program: [u8; 32]) -> [u8; 64] {
+        let mut v = [0u8; 64];
+        v[..32].copy_from_slice(&[5; 32]); // authority
+        v[32..].copy_from_slice(&program);
+        v
+    }
+
+    #[test]
+    fn mint_parser_accepts_plain_and_own_hook_only() {
+        let reg = [7u8; 32];
+        let ok = |d: &[u8]| transfer_hook_enabled_bytes(d, &reg);
+        assert_eq!(ok(&[0u8; PLAIN_MINT_LEN]), Ok(false));
+        assert_eq!(ok(&mint_with(&[(EXT_TRANSFER_HOOK, &hook_value(reg))], 0)), Ok(true));
+        // trailing unused space and a cleared hook program
+        assert_eq!(ok(&mint_with(&[(EXT_TRANSFER_HOOK, &hook_value(reg))], 7)), Ok(true));
+        assert_eq!(ok(&mint_with(&[(EXT_TRANSFER_HOOK, &hook_value([0; 32]))], 0)), Ok(false));
+        assert_eq!(
+            ok(&mint_with(&[(EXT_TRANSFER_HOOK, &hook_value([8; 32]))], 0)),
+            Err(err::TRANSFER_HOOK_MISMATCH)
+        );
+        // another extension, before or after the hook (3 = MintCloseAuthority)
+        let close: &[u8] = &[1; 32];
+        assert_eq!(ok(&mint_with(&[(3, close), (EXT_TRANSFER_HOOK, &hook_value(reg))], 0)), Err(err::MINT_HAS_EXTENSIONS));
+        assert_eq!(ok(&mint_with(&[(EXT_TRANSFER_HOOK, &hook_value(reg)), (3, close)], 0)), Err(err::MINT_HAS_EXTENSIONS));
+    }
+
+    #[test]
+    fn mint_parser_rejects_malformed_layouts() {
+        let reg = [7u8; 32];
+        let ok = |d: &[u8]| transfer_hook_enabled_bytes(d, &reg);
+        assert_eq!(ok(&[0u8; 100]), Err(err::MINT_LAYOUT_INVALID));
+        assert_eq!(ok(&[0u8; EXT_ACCOUNT_TYPE_OFFSET]), Err(err::MINT_LAYOUT_INVALID));
+        let mut wrong_type = mint_with(&[(EXT_TRANSFER_HOOK, &hook_value(reg))], 0);
+        wrong_type[EXT_ACCOUNT_TYPE_OFFSET] = 2; // a token account, not a mint
+        assert_eq!(ok(&wrong_type), Err(err::MINT_LAYOUT_INVALID));
+        // hook entry of the wrong length, and one cut short
+        assert_eq!(ok(&mint_with(&[(EXT_TRANSFER_HOOK, &[0u8; 63])], 0)), Err(err::MINT_LAYOUT_INVALID));
+        let mut cut = mint_with(&[(EXT_TRANSFER_HOOK, &hook_value(reg))], 0);
+        cut.truncate(cut.len() - 1);
+        assert_eq!(ok(&cut), Err(err::MINT_LAYOUT_INVALID));
     }
 
     #[test]

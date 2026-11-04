@@ -21,11 +21,28 @@ the contract. Take the one you need; the prime-broker flow they add up to is at 
 or your own. Each vault and each DvP ticket names its registry when it is created and accepts
 records from no other program.
 
-The vault, settlement, repo and lending programs take **plain Token-2022 mints only** — no
-extensions. `init_vault` (`0x300F`) and `create_swap` (`0x2019`, both legs) refuse any other mint: a transfer fee
-would leave less in the vault or escrow than was credited, and their token transfers do not
-forward a transfer hook's extra accounts. So a mint whose transfer hook is `psol-compliance`
-cannot go through them today; they gate on KYC with their own record checks instead.
+**Which mints each part takes.** `psol-vault` takes plain Token-2022 mints and mints whose only
+extension is a transfer hook running the vault's own registry (so `psol-compliance`, or your
+registry if it implements the hook), and repo and lending inherit that, since they move positions
+inside a vault. `psol-settlement` takes plain mints only. Any other extension is refused
+(`init_vault` `0x300F`, `create_swap` `0x2019`, both legs): a transfer fee would leave less in the
+vault or escrow than was credited. A hook running another program is refused too (`0x3050`), at
+`init_vault` and on every later deposit and withdrawal, since the hook authority can repoint it;
+if it does, the vault's tokens stay put until it points the hook back at the registry or clears it.
+
+A hook-mint vault needs two things from you:
+- **Register the vault PDA in the registry and verify it.** The hook checks the owners of both
+  token accounts, and the vault PDA owns one side of every deposit and withdrawal; until it has a
+  `VERIFIED` record the hook refuses them (`0x1010`, no record). The same record later gates the
+  whole vault: suspending it stops every deposit and withdrawal.
+- **Append the hook's accounts to `deposit` and `withdraw`**, after the documented ones: the
+  mint's `ExtraAccountMetaList` PDA (`[b"extra-account-metas", mint]` under the registry), the
+  `AccountRecord` of the source and of the destination owner, and the registry program
+  (`psol_vault::TRANSFER_HOOK_EXTRAS`). The vault forwards them to Token-2022 read-only; without
+  them the transfer fails.
+
+Settlement does not take hook mints because its escrows are held by a new PDA per ticket, and
+each would need its own verified record.
 
 ## Quickstart
 
@@ -149,7 +166,8 @@ before depositing into a vault you did not create.
 ## How the parts fit: a prime broker
 
 Together the parts make a small prime broker. `psol-compliance` is the registry. Participants
-deposit into one `psol-vault` per asset (plain Token-2022 mints; see the note under the table). Two
+deposit into one `psol-vault` per asset (plain Token-2022 mints, or mints whose transfer hook is the
+registry; see the note under the table). Two
 participants can then lock positions for a repo (`psol-repo`), open a term loan whose collateral
 is valued with per-asset-class haircuts and oracle prices (`psol-lending`, reading `RiskParams`
 and `PriceFeed`s from the registry), or swap an asset for cash outright (`psol-settlement`). The
@@ -163,7 +181,7 @@ the prime broker on Reth in rdk, and a sibling to
 
 ```bash
 ./scripts/build-sbf.sh       # every program to target/deploy/*.so (the e2e tests load these)
-cargo test --workspace       # 156 tests: unit + LiteSVM end-to-end for every part
+cargo test --workspace       # 165 tests: unit + LiteSVM end-to-end for every part
 ```
 
 ### Fuzzing the vault

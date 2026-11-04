@@ -928,3 +928,238 @@ fn withdraw_rejects_a_destination_not_owned_by_the_depositor() {
     assert!(err.contains(&format!("Custom({})", 0x300E)), "expected TOKEN_ACCOUNT_MISMATCH, got {err}");
     assert_eq!(balance(&svm, &outsider_ata), 0);
 }
+
+// ─── Transfer-hook mints ─────────────────────────────────────────────────
+
+/// A Token-2022 mint whose only extension is a transfer hook running
+/// `hook_program`, with the payer as hook authority and mint authority.
+fn create_hook_mint(svm: &mut LiteSVM, payer: &Keypair, mint_kp: &Keypair, hook_program: Address) {
+    use spl_token_2022::extension::{transfer_hook, ExtensionType};
+    let space = ExtensionType::try_calculate_account_len::<Mint>(&[ExtensionType::TransferHook]).unwrap();
+    let lamports = svm.minimum_balance_for_rent_exemption(space);
+    let create = solana_system_interface::instruction::create_account(
+        &payer.pubkey(), &mint_kp.pubkey(), lamports, space as u64, &spl_token_2022::ID,
+    );
+    let hook = transfer_hook::instruction::initialize(
+        &spl_token_2022::ID, &mint_kp.pubkey(), Some(payer.pubkey()), Some(hook_program),
+    )
+    .unwrap();
+    let init = spl_token_2022::instruction::initialize_mint2(&spl_token_2022::ID, &mint_kp.pubkey(), &payer.pubkey(), None, 6).unwrap();
+    send(svm, &[create, hook, init], &[payer, mint_kp]);
+}
+
+fn derive_meta_list(mint: &Address) -> Address {
+    Address::find_program_address(&[seeds::EXTRA_META_LIST, mint.as_ref()], &compliance_program_id()).0
+}
+
+fn ix_init_meta_list(payer: &Address, mint: &Address) -> Instruction {
+    Instruction {
+        program_id: compliance_program_id(),
+        accounts: vec![
+            AccountMeta::new(*payer, true),
+            AccountMeta::new(derive_meta_list(mint), false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new_readonly(*payer, true),
+            AccountMeta::new_readonly(solana_system_interface::program::ID, false),
+        ],
+        data: psol_compliance::hook_disc::INITIALIZE_EXTRA_ACCOUNT_METAS.to_vec(),
+    }
+}
+
+/// The accounts `psol_vault::TRANSFER_HOOK_EXTRAS` describes, for a
+/// transfer between token accounts owned by `from` and `to`.
+fn hook_extras(mint: &Address, from: &Address, to: &Address) -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new_readonly(derive_meta_list(mint), false),
+        AccountMeta::new_readonly(derive_record(from), false),
+        AccountMeta::new_readonly(derive_record(to), false),
+        AccountMeta::new_readonly(compliance_program_id(), false),
+    ]
+}
+
+fn verify(svm: &mut LiteSVM, payer: &Keypair, participant: &Address) {
+    send(svm, &[ix_register_account(&payer.pubkey(), participant)], &[payer]);
+    send(svm, &[ix_update_status(&payer.pubkey(), participant, compliance_status::VERIFIED)], &[payer]);
+}
+
+/// A vault for a mint whose transfer hook is the compliance program, with
+/// its meta list, the vault PDA verified (`verify_vault`) and one verified
+/// depositor holding 1_000. Returns (mint, vault_ata, depositor, depositor_ata).
+fn hook_vault(svm: &mut LiteSVM, payer: &Keypair, verify_vault: bool) -> (Address, Address, Keypair, Address) {
+    send(svm, &[ix_initialize_registry(&payer.pubkey())], &[payer]);
+    let mint_kp = Keypair::new();
+    create_hook_mint(svm, payer, &mint_kp, compliance_program_id());
+    let mint = mint_kp.pubkey();
+    send(svm, &[ix_init_meta_list(&payer.pubkey(), &mint)], &[payer]);
+    send(svm, &[ix_init_vault(&payer.pubkey(), &mint)], &[payer]);
+    let vault = derive_vault(&mint);
+    if verify_vault {
+        verify(svm, payer, &vault);
+    }
+    let vault_ata = create_user_ata(svm, payer, &mint, &vault);
+    let depositor = Keypair::new();
+    verify(svm, payer, &depositor.pubkey());
+    let depositor_ata = create_user_ata(svm, payer, &mint, &depositor.pubkey());
+    mint_to(svm, payer, &mint, payer, &depositor_ata, 1_000);
+    (mint, vault_ata, depositor, depositor_ata)
+}
+
+fn with_extras(mut ix: Instruction, extras: Vec<AccountMeta>) -> Instruction {
+    ix.accounts.extend(extras);
+    ix
+}
+
+#[test]
+fn hook_mint_deposit_and_withdraw_run_the_hook() {
+    let Some((mut svm, payer)) = setup() else {
+        return;
+    };
+    let (mint, vault_ata, depositor, depositor_ata) = hook_vault(&mut svm, &payer, true);
+    let d = depositor.pubkey();
+    let vault = derive_vault(&mint);
+
+    let deposit = with_extras(ix_deposit(&d, &payer.pubkey(), &mint, &depositor_ata, &vault_ata, 1_000), hook_extras(&mint, &d, &vault));
+    send(&mut svm, &[deposit], &[&payer, &depositor]);
+    assert_eq!(balance(&svm, &vault_ata), 1_000);
+
+    let withdraw = with_extras(ix_withdraw(&d, &mint, &vault_ata, &depositor_ata, 400), hook_extras(&mint, &vault, &d));
+    send(&mut svm, &[withdraw], &[&payer, &depositor]);
+    assert_eq!(balance(&svm, &vault_ata), 600);
+    assert_eq!(balance(&svm, &depositor_ata), 400);
+    let pos = svm.get_account(&derive_position(&vault, &d)).unwrap();
+    assert_eq!(from_bytes::<Position>(&pos.data[..Position::LEN]).amount_deposited, 600);
+}
+
+/// Without the extra accounts Token-2022 cannot run the hook, and the
+/// deposit fails rather than skipping it.
+#[test]
+fn hook_mint_deposit_without_the_extra_accounts_fails() {
+    let Some((mut svm, payer)) = setup() else {
+        return;
+    };
+    let (mint, vault_ata, depositor, depositor_ata) = hook_vault(&mut svm, &payer, true);
+    let res = try_send(
+        &mut svm,
+        &[ix_deposit(&depositor.pubkey(), &payer.pubkey(), &mint, &depositor_ata, &vault_ata, 1_000)],
+        &[&payer, &depositor],
+    );
+    res.expect_err("a hook mint deposit without the hook's accounts must fail");
+    assert_eq!(balance(&svm, &vault_ata), 0);
+}
+
+/// The hook checks both owners, and the vault PDA owns one side: with no
+/// record for the vault PDA the hook reads an empty account and refuses the
+/// deposit (`RECORD_LAYOUT_INVALID`, 0x1010).
+#[test]
+fn hook_mint_deposit_fails_until_the_vault_pda_is_verified() {
+    let Some((mut svm, payer)) = setup() else {
+        return;
+    };
+    let (mint, vault_ata, depositor, depositor_ata) = hook_vault(&mut svm, &payer, false);
+    let d = depositor.pubkey();
+    let vault = derive_vault(&mint);
+    let deposit = || with_extras(ix_deposit(&d, &payer.pubkey(), &mint, &depositor_ata, &vault_ata, 1_000), hook_extras(&mint, &d, &vault));
+
+    let err = format!("{:?}", try_send(&mut svm, &[deposit()], &[&payer, &depositor]).expect_err("hook must refuse"));
+    assert!(err.contains(&format!("Custom({})", 0x1010)), "expected the hook's RECORD_LAYOUT_INVALID, got {err}");
+
+    verify(&mut svm, &payer, &vault);
+    svm.expire_blockhash();
+    send(&mut svm, &[deposit()], &[&payer, &depositor]);
+    assert_eq!(balance(&svm, &vault_ata), 1_000);
+}
+
+#[test]
+fn init_vault_rejects_a_hook_running_another_program() {
+    let Some((mut svm, payer)) = setup() else {
+        return;
+    };
+    let mint_kp = Keypair::new();
+    create_hook_mint(&mut svm, &payer, &mint_kp, vault_program_id());
+    let res = try_send(&mut svm, &[ix_init_vault(&payer.pubkey(), &mint_kp.pubkey())], &[&payer]);
+    let err = format!("{:?}", res.expect_err("a hook running another program must be refused"));
+    assert!(err.contains(&format!("Custom({})", 0x3050)), "expected TRANSFER_HOOK_MISMATCH, got {err}");
+}
+
+/// The hook authority can point the hook at another program after
+/// `init_vault`; deposits must notice.
+#[test]
+fn deposit_rejects_after_the_hook_program_is_changed() {
+    let Some((mut svm, payer)) = setup() else {
+        return;
+    };
+    let (mint, vault_ata, depositor, depositor_ata) = hook_vault(&mut svm, &payer, true);
+    let update = spl_token_2022::extension::transfer_hook::instruction::update(
+        &spl_token_2022::ID, &mint, &payer.pubkey(), &[], Some(vault_program_id()),
+    )
+    .unwrap();
+    send(&mut svm, &[update], &[&payer]);
+
+    let d = depositor.pubkey();
+    let deposit = with_extras(
+        ix_deposit(&d, &payer.pubkey(), &mint, &depositor_ata, &vault_ata, 1_000),
+        hook_extras(&mint, &d, &derive_vault(&mint)),
+    );
+    let err = format!("{:?}", try_send(&mut svm, &[deposit], &[&payer, &depositor]).expect_err("must refuse"));
+    assert!(err.contains(&format!("Custom({})", 0x3050)), "expected TRANSFER_HOOK_MISMATCH, got {err}");
+}
+
+#[test]
+fn init_vault_rejects_a_hook_mint_with_another_extension() {
+    let Some((mut svm, payer)) = setup() else {
+        return;
+    };
+    use spl_token_2022::extension::{transfer_hook, ExtensionType};
+    let mint = Keypair::new();
+    let space = ExtensionType::try_calculate_account_len::<Mint>(&[ExtensionType::TransferHook, ExtensionType::MintCloseAuthority]).unwrap();
+    let lamports = svm.minimum_balance_for_rent_exemption(space);
+    let create = solana_system_interface::instruction::create_account(
+        &payer.pubkey(), &mint.pubkey(), lamports, space as u64, &spl_token_2022::ID,
+    );
+    let hook = transfer_hook::instruction::initialize(
+        &spl_token_2022::ID, &mint.pubkey(), Some(payer.pubkey()), Some(compliance_program_id()),
+    )
+    .unwrap();
+    let close = spl_token_2022::instruction::initialize_mint_close_authority(
+        &spl_token_2022::ID, &mint.pubkey(), Some(&payer.pubkey()),
+    )
+    .unwrap();
+    let init = spl_token_2022::instruction::initialize_mint2(&spl_token_2022::ID, &mint.pubkey(), &payer.pubkey(), None, 6).unwrap();
+    send(&mut svm, &[create, hook, close, init], &[&payer, &mint]);
+
+    let res = try_send(&mut svm, &[ix_init_vault(&payer.pubkey(), &mint.pubkey())], &[&payer]);
+    let err = format!("{:?}", res.expect_err("a second extension must be refused"));
+    assert!(err.contains(&format!("Custom({})", 0x300F)), "expected MINT_HAS_EXTENSIONS, got {err}");
+}
+
+/// Withdrawals check the hook too: without the extra accounts, and after
+/// the hook authority points the hook elsewhere (funds stay put until it
+/// points back or clears the hook).
+#[test]
+fn hook_mint_withdraw_needs_the_extras_and_the_registry_hook() {
+    let Some((mut svm, payer)) = setup() else {
+        return;
+    };
+    let (mint, vault_ata, depositor, depositor_ata) = hook_vault(&mut svm, &payer, true);
+    let d = depositor.pubkey();
+    let vault = derive_vault(&mint);
+    let deposit = with_extras(ix_deposit(&d, &payer.pubkey(), &mint, &depositor_ata, &vault_ata, 1_000), hook_extras(&mint, &d, &vault));
+    send(&mut svm, &[deposit], &[&payer, &depositor]);
+
+    try_send(&mut svm, &[ix_withdraw(&d, &mint, &vault_ata, &depositor_ata, 400)], &[&payer, &depositor])
+        .expect_err("withdraw without the hook's accounts must fail");
+
+    let repoint = |svm: &mut LiteSVM, program: Option<Address>| {
+        let ix = spl_token_2022::extension::transfer_hook::instruction::update(&spl_token_2022::ID, &mint, &payer.pubkey(), &[], program).unwrap();
+        svm.expire_blockhash();
+        send(svm, &[ix], &[&payer]);
+    };
+    let withdraw = || with_extras(ix_withdraw(&d, &mint, &vault_ata, &depositor_ata, 400), hook_extras(&mint, &vault, &d));
+    repoint(&mut svm, Some(vault_program_id()));
+    let err = format!("{:?}", try_send(&mut svm, &[withdraw()], &[&payer, &depositor]).expect_err("must refuse"));
+    assert!(err.contains(&format!("Custom({})", 0x3050)), "expected TRANSFER_HOOK_MISMATCH, got {err}");
+
+    repoint(&mut svm, Some(compliance_program_id()));
+    send(&mut svm, &[withdraw()], &[&payer, &depositor]);
+    assert_eq!(balance(&svm, &depositor_ata), 400);
+}

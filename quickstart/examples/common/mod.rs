@@ -633,7 +633,8 @@ pub fn open_loan(
 
 /// Accounts: [borrower (s), vault program, collateral vault, borrower's
 /// collateral position (w), cash vault, borrower's cash position (w),
-/// lender's cash position (w), loan (w), loan list (w)].
+/// lender's cash position (w), loan (w), loan list (w), compliance program,
+/// borrower's record].
 pub fn repay_loan(
     borrower: &Address,
     lender: &Address,
@@ -655,6 +656,8 @@ pub fn repay_loan(
             AccountMeta::new(position(&kv, lender), false),
             AccountMeta::new(loan(borrower, lender, collateral_mint, cash_mint, nonce), false),
             AccountMeta::new(loan_list(borrower), false),
+            AccountMeta::new_readonly(COMPLIANCE, false),
+            AccountMeta::new_readonly(record(borrower), false),
         ],
         data: vec![psol_lending::ix::REPAY_LOAN],
     }

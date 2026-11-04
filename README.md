@@ -120,7 +120,11 @@ Every part checks that the programs it relies on are the ones it was set up with
 the caller passes:
 
 - `psol-vault` stores its registry in `Vault::compliance_program` at `init_vault`; deposit,
-  withdraw and lock refuse records owned by any other program (`0x300C`).
+  withdraw, lock and internal transfers refuse records owned by any other program (`0x300C`).
+  An internal transfer checks the sender's record, and a withdrawal pays only into the
+  depositor's own token account, so a barred depositor cannot move value out through a verified
+  one. One consequence: a suspended borrower cannot repay a `psol-lending` loan (the repayment
+  is an internal transfer); the lender liquidates after maturity instead.
 - `psol-settlement` stores the registry in the ticket and in the ticket's PDA seeds, so the ticket
   address both parties expect commits to it; `settle` refuses any other (`0x2016`).
 - `psol-repo` and `psol-lending` require the vaults passed in to be the ones recorded in the
@@ -159,7 +163,7 @@ the prime broker on Reth in rdk, and a sibling to
 
 ```bash
 ./scripts/build-sbf.sh       # every program to target/deploy/*.so (the e2e tests load these)
-cargo test --workspace       # 154 tests: unit + LiteSVM end-to-end for every part
+cargo test --workspace       # 156 tests: unit + LiteSVM end-to-end for every part
 ```
 
 ## License

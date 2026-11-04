@@ -520,6 +520,8 @@ fn ix_repay_loan(
             AccountMeta::new(lender_cash_position, false),
             AccountMeta::new(loan, false),
             AccountMeta::new(derive_loan_list(borrower), false),
+            AccountMeta::new_readonly(compliance_program_id(), false),
+            AccountMeta::new_readonly(derive_record(borrower), false),
         ],
         data: vec![lending_ix::REPAY_LOAN],
     }

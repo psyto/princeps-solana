@@ -481,6 +481,9 @@ fn withdraw(
     }
 
     require_token_account(vault_ata_ai, mint_ai.key(), vault_ai.key())?;
+    // Withdrawals go to the depositor's own account, so a verified
+    // depositor cannot pay out to a wallet the registry has barred.
+    require_token_account(depositor_ata_ai, mint_ai.key(), depositor_ai.key())?;
 
     // CPI Token-2022 transfer_checked vault_ata → depositor_ata,
     // signed as the vault PDA.
@@ -686,6 +689,11 @@ fn unlock_position(
 ///   [1, read]     vault PDA (both positions must reference this)
 ///   [2, write]    from_position PDA
 ///   [3, write]    to_position PDA
+///   [4, read]     compliance program (must be the vault's)
+///   [5, read]     from_depositor's `AccountRecord`
+///
+/// The sender must pass compliance: otherwise a barred depositor could
+/// move their balance to a verified accomplice, who then withdraws.
 ///
 /// Instruction data (after dispatch tag):
 ///   [0..8]    amount: u64 LE
@@ -699,8 +707,10 @@ fn transfer_within_vault(
         vault_ai,
         from_position_ai,
         to_position_ai,
+        compliance_program_ai,
+        from_record_ai,
     ] = match accounts {
-        [d, v, f, t, ..] => [d, v, f, t],
+        [d, v, f, t, cp, r, ..] => [d, v, f, t, cp, r],
         _ => return Err(ProgramError::NotEnoughAccountKeys),
     };
     if data.len() < 8 {
@@ -711,6 +721,9 @@ fn transfer_within_vault(
         return Err(err::ZERO_AMOUNT);
     }
     require_signer(from_depositor_ai)?;
+    let vault_compliance = read_vault_compliance(vault_ai, program_id)?;
+    require_compliance_program(&vault_compliance, compliance_program_ai)?;
+    verify_record(from_record_ai, compliance_program_ai.key(), from_depositor_ai.key())?;
     // Source must match the depositor's PDA.
     verify_position(
         from_position_ai,

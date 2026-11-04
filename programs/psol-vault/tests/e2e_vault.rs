@@ -847,3 +847,84 @@ fn init_vault_rejects_a_mint_with_extensions() {
     let err = format!("{:?}", res.expect_err("a mint with extensions must be refused"));
     assert!(err.contains(&format!("Custom({})", 0x300F)), "expected MINT_HAS_EXTENSIONS, got {err}");
 }
+
+fn verified_depositor_with_deposit(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    mint: &Address,
+    vault_ata: &Address,
+) -> (Keypair, Address) {
+    let k = Keypair::new();
+    svm.airdrop(&k.pubkey(), 1_000_000_000).unwrap();
+    send(svm, &[ix_register_account(&payer.pubkey(), &k.pubkey())], &[payer]);
+    send(svm, &[ix_update_status(&payer.pubkey(), &k.pubkey(), compliance_status::VERIFIED)], &[payer]);
+    let ata = create_user_ata(svm, payer, mint, &k.pubkey());
+    mint_to(svm, payer, mint, payer, &ata, 1_000);
+    send(svm, &[ix_deposit(&k.pubkey(), &payer.pubkey(), mint, &ata, vault_ata, 1_000)], &[payer, &k]);
+    (k, ata)
+}
+
+/// A suspended depositor moves their balance to a verified accomplice's
+/// position inside the vault. `transfer_within_vault` must refuse, or the
+/// accomplice could withdraw it.
+#[test]
+fn transfer_within_vault_rejects_a_suspended_sender() {
+    let Some((mut svm, payer)) = setup() else {
+        return;
+    };
+    send(&mut svm, &[ix_initialize_registry(&payer.pubkey())], &[&payer]);
+    let mint_kp = Keypair::new();
+    create_plain_mint(&mut svm, &payer, &mint_kp, &payer.pubkey(), 6);
+    let mint = mint_kp.pubkey();
+    send(&mut svm, &[ix_init_vault(&payer.pubkey(), &mint)], &[&payer]);
+    let vault = derive_vault(&mint);
+    let vault_ata = create_user_ata(&mut svm, &payer, &mint, &vault);
+    let (barred, _) = verified_depositor_with_deposit(&mut svm, &payer, &mint, &vault_ata);
+    let (accomplice, _) = verified_depositor_with_deposit(&mut svm, &payer, &mint, &vault_ata);
+    send(&mut svm, &[ix_update_status(&payer.pubkey(), &barred.pubkey(), compliance_status::SUSPENDED)], &[&payer]);
+
+    let mut data = vec![vault_ix::TRANSFER_WITHIN_VAULT];
+    data.extend_from_slice(&1_000u64.to_le_bytes());
+    let ix = Instruction {
+        program_id: vault_program_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(barred.pubkey(), true),
+            AccountMeta::new_readonly(vault, false),
+            AccountMeta::new(derive_position(&vault, &barred.pubkey()), false),
+            AccountMeta::new(derive_position(&vault, &accomplice.pubkey()), false),
+            AccountMeta::new_readonly(compliance_program_id(), false),
+            AccountMeta::new_readonly(derive_record(&barred.pubkey()), false),
+        ],
+        data,
+    };
+    let res = try_send(&mut svm, &[ix], &[&payer, &barred]);
+    let err = format!("{:?}", res.expect_err("a suspended sender must not move balance"));
+    assert!(err.contains(&format!("Custom({})", 0x3013)), "expected COMPLIANCE_SUSPENDED, got {err}");
+}
+
+/// A verified depositor withdraws into someone else's token account. The
+/// vault pays out only to the depositor's own account.
+#[test]
+fn withdraw_rejects_a_destination_not_owned_by_the_depositor() {
+    let Some((mut svm, payer)) = setup() else {
+        return;
+    };
+    send(&mut svm, &[ix_initialize_registry(&payer.pubkey())], &[&payer]);
+    let mint_kp = Keypair::new();
+    create_plain_mint(&mut svm, &payer, &mint_kp, &payer.pubkey(), 6);
+    let mint = mint_kp.pubkey();
+    send(&mut svm, &[ix_init_vault(&payer.pubkey(), &mint)], &[&payer]);
+    let vault = derive_vault(&mint);
+    let vault_ata = create_user_ata(&mut svm, &payer, &mint, &vault);
+    let (depositor, _) = verified_depositor_with_deposit(&mut svm, &payer, &mint, &vault_ata);
+    let outsider_ata = create_user_ata(&mut svm, &payer, &mint, &Keypair::new().pubkey());
+
+    let res = try_send(
+        &mut svm,
+        &[ix_withdraw(&depositor.pubkey(), &mint, &vault_ata, &outsider_ata, 500)],
+        &[&payer, &depositor],
+    );
+    let err = format!("{:?}", res.expect_err("withdraw to another owner's account must reject"));
+    assert!(err.contains(&format!("Custom({})", 0x300E)), "expected TOKEN_ACCOUNT_MISMATCH, got {err}");
+    assert_eq!(balance(&svm, &outsider_ata), 0);
+}

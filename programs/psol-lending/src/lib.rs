@@ -431,6 +431,8 @@ fn open_loan(
         cash_vault_ai,
         lender_cash_position_ai,
         borrower_cash_position_ai,
+        compliance_program_ai,
+        lender_record_ai,
         principal_amount,
     )?;
 
@@ -506,6 +508,10 @@ fn open_loan(
 ///   [6, write]     lender's cash Position PDA   (transfer destination)
 ///   [7, write]     loan PDA (writable for status flip)
 ///   [8, write]     borrower's `LoanList` PDA (entry is removed)
+///   [9, read]      compliance program (the cash vault's)
+///   [10, read]     borrower's `AccountRecord` — the vault checks it on the
+///                  repayment transfer, so a suspended borrower cannot repay
+///                  (the lender liquidates after maturity instead)
 fn repay_loan(program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> ProgramResult {
     let [
         borrower_ai,
@@ -517,9 +523,11 @@ fn repay_loan(program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> Pr
         lender_cash_position_ai,
         loan_ai,
         loan_list_ai,
+        compliance_program_ai,
+        borrower_record_ai,
     ] = match accounts {
-        [b, vp, cv, cpos, cav, bcpos, lcpos, ln, ll, ..] => {
-            [b, vp, cv, cpos, cav, bcpos, lcpos, ln, ll]
+        [b, vp, cv, cpos, cav, bcpos, lcpos, ln, ll, cp, br, ..] => {
+            [b, vp, cv, cpos, cav, bcpos, lcpos, ln, ll, cp, br]
         }
         _ => return Err(ProgramError::NotEnoughAccountKeys),
     };
@@ -621,6 +629,8 @@ fn repay_loan(program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> Pr
         cash_vault_ai,
         borrower_cash_position_ai,
         lender_cash_position_ai,
+        compliance_program_ai,
+        borrower_record_ai,
         total_due,
     )?;
 
@@ -1589,6 +1599,8 @@ fn cpi_transfer_within_vault(
     vault_ai: &AccountInfo,
     from_position_ai: &AccountInfo,
     to_position_ai: &AccountInfo,
+    compliance_program_ai: &AccountInfo,
+    from_record_ai: &AccountInfo,
     amount: u64,
 ) -> ProgramResult {
     let mut data = [0u8; 1 + 8];
@@ -1600,13 +1612,22 @@ fn cpi_transfer_within_vault(
         AccountMeta::new(vault_ai.key(), false, false),
         AccountMeta::new(from_position_ai.key(), true, false),
         AccountMeta::new(to_position_ai.key(), true, false),
+        AccountMeta::new(compliance_program_ai.key(), false, false),
+        AccountMeta::new(from_record_ai.key(), false, false),
     ];
     let ix = Instruction {
         program_id: vault_program_id,
         data: &data,
         accounts: &metas,
     };
-    let infos = [from_depositor_ai, vault_ai, from_position_ai, to_position_ai];
+    let infos = [
+        from_depositor_ai,
+        vault_ai,
+        from_position_ai,
+        to_position_ai,
+        compliance_program_ai,
+        from_record_ai,
+    ];
     pinocchio::cpi::slice_invoke_signed(&ix, &infos, &[])
 }
 

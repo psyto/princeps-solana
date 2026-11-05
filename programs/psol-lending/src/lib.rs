@@ -567,9 +567,6 @@ fn repay_loan(program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> Pr
         if l.status != loan_status::OPEN {
             return Err(err::NOT_OPEN);
         }
-        if &l.borrower != borrower_ai.key() {
-            return Err(err::SIGNER_NOT_PARTY);
-        }
         let now = Clock::get()?.slot;
         if now > l.maturity_slot {
             return Err(err::MATURED);

@@ -1,0 +1,15 @@
+name: solinv debug
+on: pull_request
+jobs:
+  d:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - shell: bash
+        run: |
+          git --version; perl -v | sed -n 2p
+          git ls-files -- 'src/*.rs' '*/src/*.rs' | head
+          echo ---
+          d=programs/psol-lending/src; ls -la $d
+          find "$d" -name '*.rs' -type f -exec perl -0777 -ne 's{/\*.*?\*/}{}gs; s{//[^\n]*}{}g; $f = 1 if /\b(?:lazy_program_entrypoint|program_entrypoint|lazy_entrypoint|entrypoint|entrypoint_no_alloc)\s*!\s*\(|\bextern\s+"C"\s+fn\s+entrypoint\b/; END { exit($f ? 0 : 1) }' {} +; echo "native=$?"
+          grep -n entrypoint $d/lib.rs | head -3
